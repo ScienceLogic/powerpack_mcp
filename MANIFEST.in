@@ -1,0 +1,26 @@
+# Source-distribution contents beyond what setuptools-scm's file finder provides.
+#
+# Why this file is necessary:
+#
+# The RPM spec's %install reads these paths directly out of the unpacked sdist:
+#
+#     packaging/systemd/powerpack-mcp.service
+#     packaging/nginx/powerpack-mcp.fragment
+#     packaging/nginx/powerpack-mcp-zone.conf
+#     docs/operations.md
+#
+# setuptools-scm populates the sdist from git-tracked files, so files that are not yet
+# committed are silently omitted, and `rpmbuild` then fails at %install.  The RPM is built
+# from an sdist, so an sdist missing these files cannot produce a package at all.
+#
+# `graft` matches on the filesystem, not on git, so the sdist is correct whether or not
+# the files happen to be committed.  `.github/workflows/packaging.yml` also asserts the
+# sdist contains these paths, so a missing file fails at sdist build time.
+graft packaging
+graft docs
+include LICENSE
+
+# Deliberately not pruned: Dockerfile, docker-compose*.yml, .github/ and tests/ remain in
+# the sdist.  This is not the enforcement point: they are excluded from the RPM payload,
+# which %files achieves by listing only what is wanted.  Pruning them here would create a
+# second, weaker place to get that wrong.

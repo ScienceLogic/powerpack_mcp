@@ -1,0 +1,153 @@
+# Skylar One PowerPack MCP Server -- systemd unit.
+#
+# Installed to /usr/lib/systemd/system/, the vendor directory used by the other em7 services.
+# Disabled by default: installation neither starts nor enables this unit.  Enabling it is a
+# separate operator decision:
+#
+#     systemctl enable --now powerpack-mcp
+#
+# Every path below references /opt/em7/services/powerpack-mcp, which is a symlink to the
+# versioned directory, as for the other em7 services.  That keeps this unit file
+# version-independent: it never needs editing on upgrade.
+
+[Unit]
+Description=Skylar One PowerPack MCP Server
+Documentation=file:/opt/em7/services/powerpack-mcp/docs/operations.md
+After=network.target
+
+[Service]
+Type=simple
+
+# The platform's shared service account, matching lce.service, rather than a dedicated one.  The
+# service never runs as root, but powerpack-mcp.env is readable by any process running as
+# s-em7-core.  Switching to a dedicated account is a one-line change; nothing else depends on the
+# identity.
+User=s-em7-core
+Group=s-em7-core
+
+WorkingDirectory=/opt/em7/services/powerpack-mcp
+
+# There is deliberately no EnvironmentFile= here.  Do not add one back, with or without a `-`
+# prefix.  It was removed for two reasons, and the `-` would fix only the first:
+#
+#   1. An absent env file is meant to be non-fatal: the service starts with no configuration file
+#      at all.  Without the `-`, systemd instead failed the unit with an opaque error.
+#
+#   2. It bypassed the permission check.  The application parses this same file itself and
+#      refuses one with the wrong mode or owner.  With two parsers reading one file,
+#      systemd-injected values win because the env file never overrides them, so a file with
+#      wrong permissions had its values loaded by systemd before the application's refusal could
+#      take effect.
+#      Without the line, load_env_file is the only mechanism, which keeps the exact-path rule and
+#      the permission check enforceable.
+#
+# tests/unit/test_systemd_unit.py asserts this directive's absence by parsing this file, because
+# this comment contains the string "EnvironmentFile=".
+
+# Module invocation, not the console script.
+#
+# A console script's shebang is baked when the venv is built, so a venv built inside an RPM
+# buildroot ships a shebang pointing at a directory that does not exist on the appliance.  LCE
+# 3.1.0 ships with that defect: its venv_clean/bin/pip fails with "bad interpreter: No such file
+# or directory".
+#
+# bin/python is a symlink, so there is no shebang to be wrong.  All three em7 Python services do
+# this, and it rules the failure out rather than relying on a build flag whose omission is silent.
+ExecStart=/opt/em7/services/powerpack-mcp/venv/bin/python -m powerpack_mcp
+
+# As in lce.service.  Without this the default is Restart=no and the service would stay down
+# after any crash.
+Restart=on-failure
+RestartSec=5s
+
+# This line is why a configuration typo does not become a crash loop.
+#
+# `Restart=on-failure` with `RestartSec=5s` and no start-limit tuning never lets the unit reach
+# `failed`.  systemd's defaults are DefaultStartLimitIntervalSec=10s and DefaultStartLimitBurst=5,
+# so at a 5 s spacing at most two start attempts fall inside any 10 s window and the burst
+# threshold of five is never reached.  A single mistyped ENABLE_* value would restart the service
+# every five seconds for ever instead of stopping and reporting itself broken.
+#
+# `main()` exits 78 (EX_CONFIG from BSD sysexits.h) for a configuration failure and only for a
+# configuration failure: it logs one startup_failed record and exits without retrying.  A genuine
+# crash still exits 1 and is still restarted, which is what Restart=on-failure is for.  The two
+# failure classes are separated by exit status rather than by a threshold that would apply to
+# both.
+#
+# This follows from systemd's documented defaults and has not been observed on an appliance.
+# Whether the appliance's systemd 239 honours RestartPreventExitStatus as documented is on the
+# manual acceptance list.
+#
+# tests/unit/test_systemd_unit.py asserts this directive's presence by parsing this file.
+RestartPreventExitStatus=78
+
+# rsyslog, not journald.
+#
+# journald on the appliance is volatile: journald.conf sets nothing, /var/log/journal does not
+# exist, and /run/log/journal is on tmpfs, so records are lost on every reboot.  All three em7
+# Python services log to syslog instead.
+#
+# SyslogIdentifier=silo.* is matched by /etc/rsyslog.d/local_log_messages.d/sl1.conf, which
+# routes records to /var/log/sl1/powerpack_mcp.log.  That file is already covered by
+# /etc/logrotate.d/sl1, so this package ships no logrotate configuration.
+#
+# Retention depends on log volume, not time, because that rule sets minsize 5M:
+#   <= ~0.6 MB/day  -> >= 90 days
+#      ~5   MB/day  -> ~11 days
+#   >= 30   MB/day  -> < 2 days
+# See docs/operations.md.
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=silo.powerpack_mcp
+
+# Resource limits.  These three values are not independent knobs:
+#
+#   MemoryMax  = 512M  hard limit.  Exceeding it is an OOM kill.
+#   MemoryHigh = 384M  soft limit.  The cgroup is throttled and reclaimed before the kill,
+#                      so pressure shows up as slowness rather than as a dead process.
+#   MAX_CONCURRENT_REQUESTS (in powerpack-mcp.env) bounds how many 10 MiB request bodies can
+#                      be in flight at once.
+#
+# Without a concurrency limit, MemoryMax was measured being breached at roughly 8 concurrent
+# maximum-size requests, below the connection pool size of 10.  Raising MAX_CONCURRENT_REQUESTS
+# without raising MemoryMax brings that OOM kill back.
+#
+# If you raise one, raise all three, and re-measure.
+MemoryMax=512M
+MemoryHigh=384M
+CPUQuota=50%
+
+# Sandboxing.
+#
+# This goes beyond the platform baseline: no em7 unit sets any of these directives, so there is
+# no precedent and these settings have not been tested on an appliance; they are on the manual
+# acceptance list.  ProtectSystem=strict makes the whole filesystem read-only apart from explicit
+# exceptions, and this service declares none because it needs none.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+# Deliberately absent:
+#
+#   ReadWritePaths / RuntimeDirectory
+#       The service writes nothing, anywhere.  rsyslog owns the log file; the service only
+#       writes to stdout.  The unit enforces this rather than the account, which matters because
+#       the shared s-em7-core account has group-write access elsewhere on the appliance.
+#
+#   AF_INET6 in RestrictAddressFamilies
+#       The listener is IPv4 loopback and the nginx fragment proxies to the literal
+#       127.0.0.1:8000, never "localhost", which could resolve to an IPv6 address the service
+#       does not bind.
+#
+#   CAP_NET_BIND_SERVICE
+#       Port 8000 is above 1024, so it is not required.
+#
+#   TimeoutStopSec
+#       The read timeout is capped at 85 s, and shutdown waits at most that long for in-flight
+#       requests, so systemd's 90 s default is enough.
+
+[Install]
+WantedBy=multi-user.target

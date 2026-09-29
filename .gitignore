@@ -1,0 +1,34 @@
+.env
+# Integration-test credentials.  `.env` above is an exact match and would not cover these,
+# so they are listed explicitly: the live suite's credentials must never reach the repository.
+.env.integration
+.env.integration.*
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+
+# Local RPM build output.  Never commit it: it is ~16 MB, it is architecture-specific, and
+# development builds are unsigned.  The RPM belongs in a CI artifact, not in git.
+out/
+rpmbuild/
+*.egg-info
+
+# Virtual environments
+.venv*
+
+# Linter caches
+.ruff_cache
+.mypy_cache
+.pytest_cache
+
+# Test tooling
+.coverage
+cov_report.xml
+.hypothesis/
+
+# macOS
+.DS_Store

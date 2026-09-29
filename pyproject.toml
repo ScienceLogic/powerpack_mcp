@@ -1,0 +1,153 @@
+[project]
+name = "powerpack-mcp"
+dynamic = ["version"]
+description = "An MCP Server for PowerPack development"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=3.4,<4",
+    "httpx>=0.28",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.0",
+]
+
+[project.urls]
+Repository = "https://github.com/ScienceLogic/powerpack_mcp"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6",
+    # The oracle for the schema-trimming property tests: a trimmed tool schema must accept exactly
+    # the input set the untrimmed one accepts, which is only checkable against an independent
+    # implementation of JSON Schema semantics.
+    #
+    # Already resolved into the venv transitively (fastmcp -> jsonschema-path -> jsonschema) and
+    # pinned by URL and sha256 in uv.lock, so this adds no new dependency or supply-chain surface.
+    # It is declared because the tests use it directly: a used-but-undeclared dependency is as much
+    # a defect as an unused declared one, and a future fastmcp release could drop jsonschema-path
+    # and silently break the suite.
+    #
+    # Being in `dev` does not keep it out of the RPM: fastmcp pulls it into the runtime venv either
+    # way.
+    "jsonschema>=4.26",
+    "mypy>=1.19.1",
+    "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "pytest-benchmark>=5.2.1",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.4",
+    "prek>=0.4.6",
+]
+
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=9"]
+build-backend = "setuptools.build_meta"
+
+# The two prompt documents are DATA, not code -- `prompts/content.py` explains why they cannot be
+# baked as Python constants (`ruff`'s 100-column limit would hard-wrap 3,542 lines of fenced JSON
+# and OpenAPI). Declared here so `uv sync --no-editable` installs them into the venv the RPM ships;
+# `tests/unit/test_prompts.py` asserts they are present and parse, so a dropped declaration fails
+# CI rather than an appliance.
+[tool.setuptools.package-data]
+powerpack_mcp = ["data/*.md"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0+unknown"
+
+[project.scripts]
+powerpack_mcp = "powerpack_mcp.main:main"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+# "typings" carries hand-written stubs for the platform packages sl_mysql and
+# MySQLdb. They are deliberately narrow: a blanket ignore_missing_imports would make
+# every DB symbol Any and quietly break the Any allowlist that
+# tests/unit/test_any_confinement.py enforces.
+mypy_path = "src:typings"
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+check_untyped_defs = false
+warn_unused_ignores = false
+disable_error_code = ["comparison-overlap", "attr-defined"]
+
+[tool.pyright]
+include = ["src", "tests"]
+stubPath = "typings"
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = "none"
+# The platform packages sl_mysql and MySQLdb are stub-only off-appliance by design: they live in
+# /opt/em7, reached at runtime through silo.pth, and mysqlclient is kept out of our dependencies
+# deliberately. "Stub present, source absent" is therefore the intended state, not a gap -- so the
+# diagnostic is disabled rather than left to add 3 warnings to a previously clean pyright baseline.
+reportMissingModuleSource = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportPrivateUsage = "none"
+
+[[tool.pyright.executionEnvironments]]
+root = "."
+extraPaths = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=powerpack_mcp --cov-report=term-missing --cov-report=xml:cov_report.xml -m \"not integration\""
+markers = [
+    "integration: tests that require a live LCE service. Excluded from the default run.",
+    "commits: tests that actually write to LCE. Implies integration; requires explicit selection.",
+]
+
+[tool.coverage.run]
+source = ["powerpack_mcp"]
+relative_files = true
+
+[tool.coverage.report]
+fail_under = 90
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+extend-exclude = [".venv*"]
+
+[tool.ruff.lint]
+select = [
+  # default
+  "E", "W", "F",
+  # bugs/correctness (bugbear, mccabe, unused args, builtin shadowing,
+  # async rules, security, blind excepts)
+  "B", "C90", "ARG", "A", "ASYNC", "S", "BLE",
+  # readability/refactoring (simplicity, flake8-comp, pie, raise/return,
+  # slots, ruff rules, refurb)
+  "SIM", "C4", "PIE", "RSE", "RET", "SLOT", "RUF", "FURB",
+  # style/formatting (isort, import conventions, tidy imports, pathlib,
+  # quotes, string concat, commas, naming, type-checking, annotations)
+  "I", "ICN", "TID", "PTH", "Q", "ISC", "COM", "N", "TC", "ANN",
+  # logging/project hygiene (logging, namespace packages, print/debugger,
+  # executable, pygrep hooks)
+  "G", "LOG", "INP", "T20", "T10", "EXE", "PGH",
+  # time/modernization (future annotations, datetime rules, 2020 checks,
+  # pyupgrade, flynt, performance)
+  "FA", "DTZ", "YTT", "UP", "FLY", "PERF",
+  # lib-specific (fastapi, pytest, numpy, pandas)
+  "FAST", "PT", "NPY", "PD"
+]
+ignore = [
+    "ANN401",
+    "COM812",
+]
+preview = true
+explicit-preview-rules = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["RUF029", "ARG001", "S", "TC"]

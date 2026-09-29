@@ -1,0 +1,189 @@
+# CI for the public copy of this repository on github.com.
+#
+# scripts/export-public.sh installs this file as .github/workflows/ci.yml in the public copy, in
+# place of the internal workflows, which depend on self-hosted runners, an internal registry and
+# GHES-only artifact actions. The build steps mirror the internal packaging workflow's `rpm` and
+# `gates` jobs; keep the two in step when either changes.
+#
+# Every push and pull request runs the checks and builds the RPM. A `v*` tag also publishes the RPM
+# as a GitHub release asset.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:8
+    steps:
+      - name: Install build prerequisites
+        run: |
+          dnf -y install python3.12 git tar gzip which libatomic >/dev/null
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # setuptools-scm needs the tags, or the version is 0.0.0+unknown
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Sync
+        run: $HOME/.local/bin/uv sync --frozen
+
+      - name: ruff check
+        run: $HOME/.local/bin/uv run ruff check src tests
+
+      - name: ruff format
+        run: $HOME/.local/bin/uv run ruff format --check src tests
+
+      - name: mypy --strict
+        run: $HOME/.local/bin/uv run mypy --strict src tests
+
+      - name: pyright
+        run: $HOME/.local/bin/uv run pyright src tests
+
+      - name: pytest with the coverage floor
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: $HOME/.local/bin/uv run pytest -q
+
+  rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:8        # the appliance's OS family
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build prerequisites
+        run: |
+          dnf -y install rpm-build systemd-rpm-macros python3.12 git tar gzip findutils which >/dev/null
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0        # setuptools-scm needs the tags, or the version is 0.0.0+unknown
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The spec builds the venv against the appliance interpreter path, which on an appliance is a
+      # symlink to /usr/bin/python3.12.
+      - name: Mirror the appliance interpreter path
+        run: |
+          set -euxo pipefail
+          mkdir -p /opt/em7/bin
+          ln -sf /usr/bin/python3.12 /opt/em7/bin/python3.12
+
+      - name: Build the sdist
+        run: |
+          set -euxo pipefail
+          rm -rf dist
+          uv build --sdist
+          n=$(find dist -name '*.tar.gz' | wc -l)
+          test "$n" -eq 1 || { echo "FAIL: dist/ must hold exactly ONE sdist, found $n"; ls -l dist; exit 1; }
+
+      - name: The sdist must carry packaging/ and docs/
+        run: |
+          set -euxo pipefail
+          tar tzf dist/*.tar.gz > sdist.list
+          for want in packaging/rpm/powerpack-mcp.spec \
+                      packaging/systemd/powerpack-mcp.service \
+                      packaging/nginx/powerpack-mcp.fragment \
+                      packaging/nginx/powerpack-mcp-zone.conf \
+                      docs/operations.md \
+                      uv.lock; do
+            grep -q "/${want}$" sdist.list \
+              || { echo "FAIL: the sdist is missing ${want}"; exit 1; }
+          done
+
+      - name: rpmbuild
+        run: |
+          set -euxo pipefail
+          SDIST=$(find dist -name '*.tar.gz')
+          VER=$(basename "$SDIST" | sed 's/^powerpack_mcp-//; s/\.tar\.gz$//')
+          RPMVER=${VER//-/.}
+          echo "sdist=$SDIST  scm_version=$VER  rpm_version=$RPMVER"
+          case "$RPMVER" in
+            0.0.0*) echo "FAIL: version resolved to ${RPMVER} -- no git tag was available to setuptools-scm"; exit 1 ;;
+          esac
+          TOP="$GITHUB_WORKSPACE/rpmbuild"
+          mkdir -p "$TOP/SPECS" "$TOP/SOURCES"
+          cp "$SDIST" "$TOP/SOURCES/"
+          cp packaging/rpm/powerpack-mcp.spec "$TOP/SPECS/"
+          rpmbuild -bb \
+            --define "_topdir $TOP" \
+            --define "service_build_version $RPMVER" \
+            "$TOP/SPECS/powerpack-mcp.spec"
+          echo "RPMVER=$RPMVER" >> "$GITHUB_ENV"
+
+      - name: Check what was actually produced
+        run: |
+          set -euxo pipefail
+          TOP="$GITHUB_WORKSPACE/rpmbuild"
+          n=$(find "$TOP/RPMS" -name '*.rpm' | wc -l)
+          test "$n" -eq 1 || { echo "FAIL: expected exactly 1 rpm, found $n"; find "$TOP/RPMS" -name '*.rpm'; exit 1; }
+          RPM=$(find "$TOP/RPMS" -name '*.rpm')
+          rpm -qp --qf '%{NAME} %{VERSION} %{RELEASE} %{ARCH}\n' "$RPM"
+          test "$(rpm -qp --qf '%{ARCH}' "$RPM")" = x86_64 \
+            || { echo "FAIL: rpm is not x86_64 -- it would install on no appliance"; exit 1; }
+          test "$(rpm -qp --qf '%{NAME}' "$RPM")" = powerpack-mcp-1.0 \
+            || { echo "FAIL: package NAME changed -- a rename turns an upgrade into a parallel install"; exit 1; }
+          rpm -qlp "$RPM" > payload.list
+          rpm -qp --requires "$RPM" > requires.list
+          DIR="/opt/em7/services/$(rpm -qp --qf '%{NAME}' "$RPM")"
+          sed -n "s|^${DIR}/||p" payload.list | cut -d/ -f1 | sort -u > top.list
+          for forbidden in tests .github Dockerfile docker-compose.yml docker-compose.editable.yml packaging; do
+            if grep -qxF "$forbidden" top.list; then
+              echo "FAIL: ${forbidden} leaked into the payload at ${DIR}/${forbidden}"
+              exit 1
+            fi
+          done
+          grep -q 'powerpack-mcp/powerpack-mcp.env' payload.list \
+            || { echo "FAIL: the %ghost env file is absent from the payload listing"; exit 1; }
+          for req in python3.12 nginx; do
+            grep -qx "$req" requires.list \
+              || { echo "FAIL: Requires: $req is missing"; exit 1; }
+          done
+          echo "RPM_PATH=$RPM" >> "$GITHUB_ENV"
+
+      - name: Upload the RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: powerpack-mcp-rpm
+          path: ${{ env.RPM_PATH }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gates, rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: powerpack-mcp-rpm
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.rpm \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

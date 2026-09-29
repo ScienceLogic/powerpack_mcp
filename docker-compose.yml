@@ -1,0 +1,13 @@
+services:
+  powerpack-mcp-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: powerpack-mcp:dev
+    env_file: .env
+    command: ["tail", "-f", "/dev/null"]
+    tty: true
+    stdin_open: true

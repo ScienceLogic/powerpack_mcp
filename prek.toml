@@ -1,0 +1,84 @@
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "check-added-large-files" },
+    { id = "check-case-conflict" },
+    { id = "check-illegal-windows-names" },
+    { id = "end-of-file-fixer" },
+    { id = "file-contents-sorter" },
+    { id = "fix-byte-order-marker" },
+    { id = "check-json" },
+    { id = "check-json5" },
+    { id = "pretty-format-json" },
+    { id = "check-toml" },
+    { id = "check-vcs-permalinks" },
+    { id = "check-yaml" },
+    { id = "check-xml" },
+    { id = "mixed-line-ending" },
+    { id = "check-symlinks" },
+    { id = "destroyed-symlinks" },
+    { id = "check-merge-conflict" },
+    { id = "detect-private-key" },
+    { id = "no-commit-to-branch", stages = ["pre-commit"] },
+    { id = "check-shebang-scripts-are-executable" },
+    { id = "check-executables-have-shebangs" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "ruff-check-fix"
+name = "ruff check (autofix)"
+entry = "uv run ruff check --fix-only --force-exclude"
+language = "system"
+types = ["python"]
+require_serial = true
+
+[[repos.hooks]]
+id = "ruff-format"
+name = "ruff format"
+entry = "uv run ruff format --force-exclude"
+language = "system"
+types = ["python"]
+require_serial = true
+
+[[repos.hooks]]
+id = "ruff-check"
+name = "ruff check"
+entry = "uv run ruff check --force-exclude"
+language = "system"
+types = ["python"]
+require_serial = true
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "mypy"
+name = "mypy"
+entry = "uv run mypy"
+language = "system"
+types = ["python"]
+pass_filenames = false
+require_serial = true
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "pyright"
+name = "pyright"
+entry = "uv run pyright"
+language = "system"
+types = ["python"]
+pass_filenames = false
+require_serial = true
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "pytest"
+name = "pytest"
+entry = "uv run pytest"
+language = "system"
+always_run = true
+pass_filenames = false
+require_serial = true
+stages = ["manual"]

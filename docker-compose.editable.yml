@@ -1,0 +1,7 @@
+services:
+  powerpack-mcp-dev:
+    build:
+      args:
+        UV_LOCKED: 0
+    volumes:
+      - .:/app

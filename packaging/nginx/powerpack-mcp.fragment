@@ -1,0 +1,255 @@
+# Skylar One PowerPack MCP Server -- nginx location fragment.
+#
+# This fragment is the service's authentication.  If it does not enforce the Skylar One
+# authentication scheme and fail closed, /mcp becomes anonymously reachable with write tools
+# exposed.
+#
+# ---------------------------------------------------------------------------------------------
+# WHERE THIS FILE GOES, AND HOW IT IS ACTIVATED
+# ---------------------------------------------------------------------------------------------
+# Installed to:  /opt/em7/services/powerpack-mcp/nginx/powerpack-mcp.fragment
+#                (a directory this package owns, via the version symlink)
+#
+# Activated by:  one include line the RPM's %post adds to
+#                /opt/em7/share/config/nginx.d/em7ngx_web_ui.fragment
+#
+# It must be included at server level, not http level.  A `location` block is illegal in the http
+# context; nginx rejects it with
+#     [emerg] "location" directive is not allowed here
+# The platform has no server-level wildcard include for third-party fragments, which is why the
+# RPM edits a platform-owned file at all.
+#
+# em7ngx_web_ui.fragment is owned by the sl-php-ui RPM and is not a %config file, so any platform
+# upgrade overwrites it and silently deletes our include line, with no .rpmsave and nothing in any
+# log.  /mcp then returns 404 while this service runs and reports healthy.  %posttrans re-adds the
+# line on this package's next upgrade, but nothing runs at the moment the platform upgrade removes
+# it.  After any platform upgrade, check that /mcp is still routed.  See docs/operations.md.
+#
+# Indented four spaces to match every other .fragment on the appliance.
+# ---------------------------------------------------------------------------------------------
+
+    location /mcp {
+        # As in lce.fragment: 308 preserves method and body, unlike 301/302.
+        if ($scheme = http) {
+            return 308 https://$host$request_uri;
+        }
+
+        # -- authentication, before anything is proxied ---------------------------------------
+        #
+        # The same mechanism as the platform's own lce.fragment: auth_request against an internal
+        # location that proxies to auth_user.em7.
+        #
+        # We reuse lce.fragment's "location = /auth_user" and must not redefine it: two
+        # definitions of one location in a single server block make the configuration fail to
+        # load.  This fragment therefore depends on lce.fragment, which ships with
+        # em7-platform-core.  If it is ever absent, auth_request fails and every /mcp request is
+        # denied; it fails closed, never open.
+        #
+        # auth_request denies on any non-2xx subresponse, including an unreachable or
+        # misconfigured authenticator.  There is no configuration of this block in which a failure
+        # of the authenticator results in a proxied request.
+        auth_request /auth_user;
+        auth_request_set $mcp_user_id  $upstream_http_x_user_id;
+
+        # The authenticator also returns X-API-Account-Base (for example "/api/account").  It is
+        # deliberately neither captured nor forwarded: the application never reads it, and it is
+        # the value behind a privilege-escalation bug fixed in lce_service (commit 0334bff), which
+        # built its authorization lookup URL as
+        # f"https://{request.headers['Host']}{request.headers['X-API-Account-Base']}/_self", so a
+        # caller could point the lookup at their own server and mint their own permissions.  This
+        # service calls the same lookup, so forwarding a header it has no use for is a latent
+        # hazard.  If you ever remove a proxy_set_header, remove any auth_request_set that fed it
+        # too; the header-allowlist test bounds proxy_set_header and would not catch an orphan.
+        #
+        # The authenticator also returns x-em7-authenticated-account and x-sl-authenticated-account
+        # (both "/api/account/<id>").  Neither is captured, and neither should be: /_self makes an
+        # account identifier unnecessary.
+
+        error_page 401 = @mcp_401;
+        error_page 403 = @mcp_403;
+        error_page 500 = @mcp_500;
+        error_page 502 = @mcp_502;
+
+        # -- only the methods the transport uses ----------------------------------------------
+        #
+        # Taken from the installed SDK rather than the documentation:
+        # mcp/server/streamable_http.py dispatches on POST, GET and DELETE, with
+        # _handle_unsupported_request for everything else.
+        #
+        # `limit_except GET` implicitly permits HEAD.  That is harmless (a HEAD reaches
+        # _handle_unsupported_request), but it means the nginx-level and SDK-level method sets
+        # differ slightly, which is expected.
+        limit_except GET POST DELETE {
+            deny all;
+        }
+
+        # -- rate limiting.  The zone is declared in powerpack-mcp-zone.conf --------------------
+        # (it cannot be declared here: limit_req_zone is valid only in the http context)
+        limit_req zone=powerpack_mcp burst=20 nodelay;
+
+        # -- the literal IPv4 loopback address -------------------------------------------------
+        # Never "localhost", which could resolve to an IPv6 address the service does not bind; the
+        # systemd unit also removes AF_INET6 from RestrictAddressFamilies.
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+
+        # -- long-lived streamable-HTTP request streams ----------------------------------------
+        # Default buffering would break the transport: it holds the response until complete,
+        # which defeats the server-sent-event stream the GET handler establishes.
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # -- the caller's credential, forwarded explicitly -------------------------------------
+        #
+        # The service holds no credential of its own, so this header is the authorisation path.
+        # It is set explicitly rather than relying on nginx forwarding unknown headers by default.
+        #
+        # This cannot disturb `auth_request /auth_user`.  That location is `internal` and sets its
+        # own `proxy_set_header Authorization $http_authorization` from the client request, so the
+        # subrequest and this upstream are independent (verified on a test appliance).
+        #
+        # An empty variable is the fail-safe: a credential-less request forwards no header at
+        # all, which the service answers with `credential_missing`.  There is nothing to fall back
+        # to.
+        #
+        # This header does not reach LCE.  lce.fragment's /lce location does not forward
+        # Authorization; LCE acts on X-User-ID, which nginx derives via auth_request_set.  This
+        # header's job is to let the caller be resolved, and if it goes missing, identity
+        # resolution never happens at all.
+        proxy_set_header Authorization $http_authorization;
+
+        # -- the forwarded caller identity -----------------------------------------------------
+        #
+        # One proxy_set_header per header is the whole control.  proxy_set_header overrides
+        # whatever the client sent, and when its value is an empty variable nginx omits the header
+        # entirely.  So a forged value cannot survive, and a failed identity lookup yields no
+        # header rather than the client's, which is the fail-safe direction.
+        proxy_set_header X-User-ID          $mcp_user_id;
+
+        # Blank three identity headers nginx does not otherwise manage.
+        #
+        # The application once read the caller identity from x-remote-user, x-forwarded-user and
+        # x-authenticated-user, none of which this platform sets.  Because nginx passed the
+        # client's value straight through, a caller sending "X-Remote-User: admin" was attributed
+        # as admin in the audit log.  The application now reads only x-user-id
+        # (FORWARDED_ACTOR_HEADERS, pinned by a test); these clears are defence in depth, so that a
+        # future widening of that tuple cannot silently reopen the hole.  Do not remove them
+        # because they look redundant.
+        proxy_set_header X-Remote-User        "";
+        proxy_set_header X-Forwarded-User     "";
+        proxy_set_header X-Authenticated-User "";
+
+        # -- access logging, to the platform's syslog target -----------------------------------
+        # Inherited from the server block, and restated here so it is visible in the file that
+        # owns the location.
+        access_log syslog:server=unix:/var/run/rsyslog.sock,facility=local7,tag=em7silo_nginx,severity=info,nohostname;
+
+        # -- client_max_body_size is deliberately unset ----------------------------------------
+        #
+        # The em7 server block already sets client_max_body_size 256M, far above the
+        # application's 10 MiB MAX_REQUEST_BODY_BYTES.  nginx's limit must sit above the
+        # application's so the application is the rejection path and the caller receives a
+        # parseable JSON error envelope rather than nginx's HTML 413.  Inheriting 256M does that.
+        #
+        # The trade-off: nginx will stream up to 256M inward before the application refuses.
+        # Because proxy_request_buffering is off, the cost is bandwidth and CPU rather than disk.
+    }
+
+    # There is no `location /ready`.  The service has no readiness route: with no configured
+    # credential there is nothing for a readiness probe to authenticate with.  LCE reachability
+    # surfaces as an `lce_unreachable` error on a real tool call instead.
+    #
+    # The path falls through to the platform, which answers 404 text/html.  It is deliberately not
+    # given an MCP-shaped envelope: the fragment should not claim a route that does not exist.
+    # The powerpack_mcp rate-limit zone is still used by /mcp.
+
+    location /health {
+        # The only anonymously reachable route.  No auth_request.
+        #
+        # It discloses nothing beyond process liveness: no version and no LCE state.  A version
+        # string here would tell an unauthenticated caller which release to look up
+        # vulnerabilities for.
+        limit_except GET {
+            deny all;
+        }
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+
+        # An anonymous liveness probe would otherwise dominate the access log.
+        access_log off;
+    }
+
+    # ---------------------------------------------------------------------------------------------
+    # ERROR ENVELOPES
+    #
+    # Every location below re-includes security_headers.fragment, and must.
+    #
+    # nginx's add_header replaces the entire inherited set rather than adding to it.  A location
+    # that sets one add_header therefore loses Strict-Transport-Security, X-Content-Type-Options and
+    # the rest, while `nginx -t` passes and the service works.
+    #
+    # The platform's own lce.fragment has this defect in its @return_* locations: they set
+    # Content-Type and do not re-include the headers, so those error responses ship without
+    # them.  We do not copy that.
+    #
+    # The envelope shape is the application's nested {"error":{...}}, not the platform's flat
+    # {"error":"..."}.  A caller hitting /mcp receives the nested shape for every application
+    # error, so matching it here means clients parse one shape.
+    # ---------------------------------------------------------------------------------------------
+
+    # Use default_type, never `add_header Content-Type`, in these blocks.
+    #
+    # With add_header, a live 401 came back carrying two Content-Type headers:
+    #
+    #     content-type: application/octet-stream      <- nginx default_type, set by `return`
+    #     content-type: application/json              <- the add_header
+    #
+    # Content-Type is a singleton field (RFC 9110 s5.5), and a client honouring the first value
+    # parses the JSON envelope as a binary blob.  `add_header` appends and cannot override what
+    # `return` already set; `default_type` is the directive for the type of a `return` body.
+    # `nginx -t` passes either way and the body is valid JSON, so only the response headers show
+    # it.  tests/unit/test_nginx_fragment.py asserts `add_header Content-Type` appears nowhere in
+    # this file's directives.
+
+    location @mcp_401 {
+        default_type application/json;
+
+        # RFC 7235: a 401 without a challenge is not a valid 401.  `always` is required, because
+        # add_header reaches a `return 401` response only when flagged; the same rule makes the
+        # security_headers include below work (that platform file declares all four of its headers
+        # `always`).
+        #
+        # charset="UTF-8" is RFC 7617's recommended form and removes ambiguity for non-ASCII
+        # credentials.  A browser hitting a 401 will show a native credential dialog.  The platform
+        # omits this header; we send it because it is what lets an MCP client discover the scheme.
+        add_header WWW-Authenticate 'Basic realm="Skylar One MCP", charset="UTF-8"' always;
+
+        include /opt/em7/share/config/nginx.d/security_headers.fragment;
+        return 401 '{"error":{"code":"unauthorized","message":"Authentication required"}}';
+    }
+
+    location @mcp_403 {
+        default_type application/json;
+        include /opt/em7/share/config/nginx.d/security_headers.fragment;
+        return 403 '{"error":{"code":"forbidden","message":"Access denied"}}';
+    }
+
+    location @mcp_500 {
+        default_type application/json;
+        include /opt/em7/share/config/nginx.d/security_headers.fragment;
+        return 500 '{"error":{"code":"auth_unavailable","message":"Failed to identify user"}}';
+    }
+
+    location @mcp_502 {
+        default_type application/json;
+        include /opt/em7/share/config/nginx.d/security_headers.fragment;
+        return 502 '{"error":{"code":"service_unavailable","message":"The MCP service is unavailable"}}';
+    }

@@ -1,0 +1,33 @@
+# Do not add `.github` here.
+#
+# The `dev` stage's test suite asserts on the workflow files.  `tests/unit/test_rpm_spec.py`
+# resolves `.github/workflows/packaging.yml` from `Path(__file__).parents[2]`, which inside the
+# container is `/app`, and `docker-compose.yml`'s dev service has no bind mount, so `/app` is
+# this build context and nothing else.  Excluding `.github` makes those tests error at fixture
+# setup with `FileNotFoundError`.
+#
+# The shipped image is unaffected, which is why this is safe: the `runtime` stage does
+# `COPY --from=build /app/.venv.container` and copies no source at all, so `.github` cannot reach
+# a published image.  The cost is only that editing a workflow invalidates the `COPY . .` layer
+# and re-runs `uv sync` -- cheap, because that step is uv-cache-mounted.
+
+.env
+.venv*
+.tox
+
+__pycache__/
+*.py[oc]
+
+.ruff_cache
+.mypy_cache
+.pytest_cache
+
+.coverage
+cov_report.xml
+
+build/
+dist/
+wheels/
+*.egg-info/
+out/
+rpmbuild/
