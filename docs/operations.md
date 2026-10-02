@@ -159,6 +159,7 @@ and an operator who set one and forgot the other would end up with a posture the
 |---|---|
 | set `LCE_VERIFY_TLS=false` | verification is relaxed for **SL1 traffic too**, not just LCE. The service logs a **WARNING on the SL1 path** when it does, so it is visible in the log and not only in this file |
 | lower `LCE_READ_TIMEOUT_SECONDS` | you also shorten the **concurrency gate's request deadline**, so a slow SL1 call holds a gate slot for less time. **One value, three jobs** |
+| wonder why a slow call fails at 28 s, not 30 s | every outbound call (SL1, LCE, database) **stops 2 s before the request deadline**, so the tool can still return its own `sl1_unreachable`, `lce_unreachable` or `db_query_timeout`. If the gate fired first, a caller whose response had already started would get no reply at all |
 | look for an SL1 timeout key | there isn't one. Tune the `LCE_*` keys, knowing they are shared |
 
 ### `LCE_VERIFY_TLS` — depends on which certificate your appliance uses
@@ -243,7 +244,7 @@ so a file that mentions none of them gets the full tool surface.
 |---|---|---|
 | *(none — there is no key)* | The **LCE** tools. Always offered | always on |
 | `ENABLE_SL1_REST_TOOLS` | **22 SL1 tools — 6 REST and 16 GraphQL.** See the warning below | enabled |
-| `ENABLE_SL1_GRAPHQL_TOOLS` | **2** generic GraphQL tools — *not* all GraphQL traffic. See below | enabled |
+| `ENABLE_SL1_GRAPHQL_TOOLS` | **3** GraphQL passthrough tools — *not* all GraphQL traffic. See below | enabled |
 | `ENABLE_DB_TOOLS` | Database **read** tools | enabled |
 | `ENABLE_DB_WRITE_TOOLS` | Database **write** tools | enabled |
 | `ENABLE_OPS_TOOLS` | Operations, capability and discovery tools | enabled |
@@ -261,8 +262,9 @@ error. Changing a flag needs a restart, which is already how every configuration
 `ENABLE_SL1_REST_TOOLS`, **only 6 are REST**: the four arbitrary-request passthroughs plus two
 Dynamic Application readers. **Sixteen are GraphQL.**
 
-So `ENABLE_SL1_GRAPHQL_TOOLS=false` removes **two** tools and leaves sixteen GraphQL tools running
-under the other flag. **If your intent is "no GraphQL at all", set both keys to `false`.**
+So `ENABLE_SL1_GRAPHQL_TOOLS=false` removes **three** tools — `sl1_graphql`,
+`sl1_graphql_introspect` and `sl1_create_guided_discovery_session` — and leaves sixteen GraphQL tools
+running under the other flag. **If your intent is "no GraphQL at all", set both keys to `false`.**
 
 **The names are deliberately left as they are**, because renaming a flag silently changes what an
 existing `.env` file switches off: an upgrade would alter a deployed tool surface with no operator
@@ -280,6 +282,90 @@ caller; schema **data** is not. That is SL1's behaviour, not this service's, and
 privilege-escalation path, because *shape* discloses no records. But if exposing the shape is
 unacceptable in your environment, `sl1_graphql_introspect` is the tool that exposes it, and
 `ENABLE_SL1_GRAPHQL_TOOLS=false` is how you remove it.
+
+#### Credential secrets and the passthroughs
+
+SL1 lets an entitled account read every stored credential's `definition` — passwords, SNMP
+community strings, SSH private keys, API keys, OAuth secrets, HTTP header values — over GraphQL and
+REST alike. "SL1 applies the caller's permissions" therefore does **not** protect credential
+secrets from a caller entitled to read credentials, so this service holds every tool to one rule:
+**no secret is ever returned.**
+
+| Tool | What it does |
+|---|---|
+| `sl1_list_credentials`, `sl1_get_credential` | Return only the per-type **allowlisted** definition fields, naming every withheld key |
+| `sl1_graphql` | **Refuses, before sending,** (1) inside a credential, any field not on the credential allowlist; (2) on any type, a secret-named field; (3) a search, sort or filter on either. See below |
+| `sl1_rest_request`, `sl1_rest_search`, `sl1_rest_describe` | Refuse every REST credential path except the plain `credential` and `credential/<type>` indexes (no `extended_fetch`, filter or sort); refuse writes to credential paths. On **every** path, refuse `filter.`/`order.` on a secret-named field, `link_disp_field` other than a plain display field, and a percent-encoded `..` |
+| `sl1_create_guided_discovery_session` | Checks every workflow action with the `sl1_graphql` rule before the session is created, and in a dry run |
+| every passthrough, and `sl1_create_guided_discovery_session` | **Scrub** the response, before pruning and whatever `prune` says: credential objects are reduced to their allowlisted fields, and secret-named keys are dropped wherever they appear, including inside JSON strings; a string that starts like JSON but does not parse is withheld. Guided Discovery results are scrubbed before they are length-bounded |
+
+The GraphQL rule, in full:
+
+1. **Credential allowlist.** A known credential-returning field (`credential`, `credentials`, the
+   typed roots such as `snmpCredentials`, `Device.snmpReadCredential`, the create, update and
+   duplicate mutations, `credentialTests`, ...), or a fragment whose type condition contains `cred`,
+   opens a credential context. Any other field whose name contains `cred`, scalar or object, is
+   refused wherever it is. Inside a context every selected field, through fragments, must be on
+   an allowlist of non-secret metadata measured by introspection on SL1 12.5.x: connection
+   plumbing, the common fields (`id`, `guid`, `name`, `type`, `subType`, `host`, `port`, `user`,
+   `timeout`, ...) and the typed credentials' settings (`snmpVersion`, `ldapDomain`, `curlUrl`,
+   ...). Everything else is refused: `definition`, `password`, `snmpReadOnlyCommunity`,
+   `curlProxyPassword`, `curlOptions`, `sshKeyData`, `alignedOrganizations` and `editedBy` (which
+   open `Organization` and `Account`), and any field SL1 adds later. `credentialFields` templates
+   hold no secrets and have their own list, which includes `definition`. The create, update and
+   duplicate mutations are held to the allowlist in their results.
+2. **Secret-named fields, on every type.** A field whose name contains `password`, `passwd`,
+   `pwd`, `community`, `secret`, `token`, `jwt`, `hash`, `cookie`, `header`, `keydata`, `privacy`,
+   `requestsub`, `curloptions` or `accesskey` is refused, except measured metadata
+   (`passwordExpiration`, `passwordReuseRule`, `passwordStrength`, `requirePasswordReset`,
+   `tokenState`, `tokenType`, `tokenDetails`, `accessKeysEnabled`, `accessKeyCategories`,
+   `accessKeyHooks`, `httpHostNameHeader`, `snmpV3PrivacyProtocol`). So is
+   `MonitorSoapXmlTransaction.httpAuthenticationCredential` (`user:password`), and so are
+   fragments on `AgentTokenSecret`, `AccessKey`, `CollectorToken` and `ApiKey`.
+3. **Probes.** A search, sort or filter can read a secret one guess at a time through
+   `pageInfo.matchCount` without selecting it. Input-object keys and enum values matching rule 2,
+   and strings naming a known secret field, are refused in every document, as literals, variable
+   defaults or variables; in a document that mentions credentials (a name, a field-path string or
+   a variable key containing `cred`), so is any name of a field outside the allowlist. Beneath an
+   input key containing `cred` (`devices(search: {snmpReadCredential: ...})`), every key and every
+   field-path string must be an allowlisted field or a search operator (`eq`, `contains`, `has`,
+   `and`, ...); a dotted or bracketed string such as `"snmpReadCredential.definition"` is held to
+   the same rule from its credential segment on. The value compared by an operator is data, not a
+   path. The `definition` and `alignedOrganizations` arguments of `createCredential` and
+   `updateCredential` are exempt: they are the caller's own input.
+
+The check parses the document rather than searching its text, so an alias (`x: definition`
+still selects `definition`), a fragment, a comment or a string can neither hide a selection nor fake
+one; a document it cannot parse is refused, and so is a fragment spread that is undefined or
+cyclic. The full rule and its rationale are in the header of
+`src/powerpack_mcp/tools/sl1_credential_guard.py`. A refusal is a `validation_blocked` error whose
+message points to the typed readers.
+
+What this refuses that an operator might want: access-key and agent-token management through
+`sl1_graphql` (including the `delete...` mutations, by name), `PowerPack.hash` and other content
+hashes, `deleteCredential` through `sl1_graphql` (use `sl1_delete_credential`), any other field
+named with `cred` that is not a known credential field, and a write through `sl1_graphql` whose
+input object carries a secret-named key outside the `createCredential`/`updateCredential`
+exemption.
+
+What the controls assume, so you can judge them:
+
+- The REST rule's shapes were observed on an appliance: `credential` lists the eight typed
+  sub-collections and `credential/<type>/<id>` is one credential, with REST-style (`cred_*`) field
+  names. No REST allowlist has been measured, which is why individual REST credentials are refused
+  outright rather than filtered, and why the response scrub withholds REST keys by name
+  (`pwd`, `pass`, `community`, `key`, `secret`, `token`, `cert`, `priv`, ...).
+- The credential allowlist was measured on SL1 12.5.x. A field a later SL1 adds to a credential
+  type is refused until it is classified, because it is not on the list; a secret-named field on a
+  new non-credential type is refused by rule 2, but a secret under an unremarkable name there is
+  not, and only the scrub's name patterns stand behind it.
+- SL1 masks some secrets itself (a `password` reads back as `************`), but not all: the
+  platform does not mark `authHeader`, `tokenKey`, `httpHeader1`/`2`, `httpHeaders` or `opts` as
+  encrypted. The controls never rely on SL1's masking.
+
+**If you do not want callers to have arbitrary GraphQL or REST at all,** set
+`ENABLE_SL1_GRAPHQL_TOOLS=false` and `ENABLE_SL1_REST_TOOLS=false`. Note the second flag also removes
+the typed SL1 tools, including the credential readers; see the warning above.
 
 #### `ENABLE_DB_WRITE_TOOLS` is nested under `ENABLE_DB_TOOLS`
 
@@ -389,10 +475,16 @@ you need a guarantee, raise that policy or ship records off-box.
 Alert on the stable **`event`** field, **never on message text**. The vocabulary is closed:
 
 `startup_failed` · `unhandled_exception` · `tls_verification_relaxed` · `validation_blocked` ·
-`lce_auth_denied` · `write_committed` · `concurrency_limited` · `tool_sets_registered`
+`lce_auth_denied` · `write_committed` · `concurrency_limited` · `tool_sets_registered` ·
+`request_deadline_exceeded`
 
 Sustained `concurrency_limited` means the bound is too low for real traffic, or a client is
 misbehaving.
+
+`request_deadline_exceeded` means the gate aborted a request at `LCE_READ_TIMEOUT_SECONDS`. Outbound
+calls stop 2 s earlier, so this should be rare: it means local work, not a backend, overran. With
+`response_started=False` the caller received a **504** with error type `request_deadline_exceeded`;
+with `response_started=True` the reply was already streaming and the caller saw it truncated.
 
 #### `tool_sets_registered` — what the server decided to offer, at every startup
 
@@ -518,6 +610,7 @@ reload; nginx keeps serving its last known-good configuration.
 | `/mcp` returns **401**/**403** with a JSON body | Authentication was enforced and denied — working as designed |
 | `/mcp` returns **500** `"Failed to identify user"` | The authenticator itself failed. Fail-closed behaviour |
 | Every tool call fails `lce_unreachable`, service otherwise healthy | Almost always `LCE_VERIFY_TLS` against a self-signed certificate (§2). **This is how LCE unreachability surfaces**; there is no readiness probe to consult |
+| A tool call fails `sl1_unreachable` / `lce_unreachable` about 2 s short of `LCE_READ_TIMEOUT_SECONDS` | The backend is slow, not down: the call ran out of its outbound budget (§2.1). Narrow the query, or raise `LCE_READ_TIMEOUT_SECONDS` (max `85.0`) |
 | Service OOM-killed under load | `MAX_CONCURRENT_REQUESTS` raised without `MemoryMax`/`MemoryHigh` (§2) |
 | Upgraded the RPM but behaviour did not change | Builds **before `dev14`** did not restart the service on upgrade: every file was replaced while the old process kept serving. Check `systemctl show -p ExecMainStartTimestamp powerpack-mcp`; if it predates the upgrade, `systemctl restart powerpack-mcp` |
 | Install reported success but `/mcp` never worked | **`nginx -t` failed and the configuration self-removed.** `rpm` cannot report a scriptlet failure — re-read the install output |

@@ -65,6 +65,45 @@ refuse, and a refusal names the **required** hook without disclosing what the ca
 
 `sl1_fetch_collection_output` additionally requires that the collection job **belongs to the caller**.
 
+**Credential secrets — never returned, by any tool.** SL1 lets an entitled caller read stored
+credential definitions, secrets included, so "the backend decides" is not enough here. The typed
+readers `sl1_list_credentials` and `sl1_get_credential` return only allowlisted, non-secret fields,
+and the passthroughs are held to the same promise:
+
+- `sl1_graphql` **refuses before sending**:
+  - **inside a credential** (under a known credential field such as `credentials` or
+    `Device.snmpReadCredential`, or a fragment on a credential type), any field not on a measured **allowlist** of non-secret metadata (`id`,
+    `name`, `host`, `snmpVersion`, ...). `definition`, `snmpReadOnlyCommunity`,
+    `curlProxyPassword`, `alignedOrganizations` and anything new are refused. The
+    `credentialFields` templates, which hold no secrets, have their own list that includes
+    `definition`;
+  - any other field whose name contains `cred`, scalar or object;
+  - **on any type**, a field whose name looks like a secret (`password`, `pwd`, `community`,
+    `token`, `jwt`, `hash`, `cookie`, `header`, ...), less a few measured metadata names such as
+    `passwordStrength` and `tokenType`;
+  - a search, sort or filter on any of those, as a literal, an enum value, a variable default or a
+    variable, including through an input key or a dotted path that names a credential
+    (`{snmpReadCredential: {has: {definition: ...}}}`, `"snmpReadCredential.definition"`).
+
+  The check parses the document, so aliases, fragments, comments and strings cannot hide or fake a
+  selection; a document it cannot parse is refused.
+- `sl1_rest_request`, `sl1_rest_search` and `sl1_rest_describe` refuse every REST credential
+  resource except the plain `credential` and `credential/<type>` indexes (no `extended_fetch`,
+  filter or sort), which are reduced to `URI` and `description`. Writes to credential paths are
+  refused; use the typed credential writers. On **every** path, `filter.`/`order.` on a
+  secret-named field (or `verification_answer`/`verification_question`) is refused, and
+  `link_disp_field` may name only a plain display field such as `name` or `description`.
+- `sl1_create_guided_discovery_session` checks every workflow action with the same GraphQL rule
+  before the session is created, and in a dry run.
+- Every passthrough response, and `sl1_create_guided_discovery_session`'s, is **scrubbed** as a
+  second layer: credential objects are reduced to their allowlisted fields and secret-named keys
+  are dropped wherever they appear, including inside JSON strings. A string that starts like JSON
+  but does not parse (a truncated one) is withheld.
+
+A refusal is a `validation_blocked` error that points to the typed readers. To remove the
+passthroughs entirely, set `ENABLE_SL1_GRAPHQL_TOOLS=false` and `ENABLE_SL1_REST_TOOLS=false` (see
+`docs/operations.md`).
+
 ## Configuration
 
 All configuration is read from environment variables and validated by a pydantic model.
@@ -98,7 +137,7 @@ outbound header name is fixed at `Authorization`, and the credential arrives per
 | `SL1_DEFAULT_TARGET_HOST` | `localhost` | Same rules. No per-call override |
 | `LCE_VERIFY_TLS` | `true` | Governs **both** LCE and SL1 — same host, same certificate. Disabling logs a WARNING on **every affected request** |
 | `LCE_CONNECT_TIMEOUT_SECONDS` | `2.0` | |
-| `LCE_READ_TIMEOUT_SECONDS` | `30.0` | Capped at `85.0`; also the shutdown drain bound |
+| `LCE_READ_TIMEOUT_SECONDS` | `30.0` | Capped at `85.0`; also the request deadline and the shutdown drain bound. Outbound calls stop 2 s before the deadline |
 | `MAX_REQUEST_BODY_BYTES` | `10485760` | 10 MiB inbound |
 | `MAX_RESPONSE_BODY_BYTES` | `10485760` | 10 MiB outbound, streamed and aborted at the cap |
 
@@ -153,7 +192,7 @@ one place (`shaping.drop_empty`) and reused everywhere rather than reimplemented
 **Turning it off.** The two passthrough tools — `sl1_rest_request` and `sl1_graphql` — take
 `prune: bool = True`. Set it `false` to see the literal shape, where an empty value and an absent
 one are distinguishable. The typed tools always prune; use a passthrough when you need the raw
-document.
+document. `prune=false` never turns off the credential-secret scrub, which runs first.
 
 **Not pruned:** payloads this service *constructs* rather than relays — a collection's `lines`, a
 `server_health` verdict, an audit record. There an empty value is a measurement, not noise.

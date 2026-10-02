@@ -83,6 +83,10 @@ MUST_BE_ANY_FREE: frozenset[str] = frozenset(
         "tools/sl1_db_descriptors.py",
         "tools/sl1_db_registry.py",
         "tools/sl1_db_pipeline.py",
+        # The credential guard and its GraphQL scanner. Security logic over untyped JSON is where
+        # ``Any`` would hide a missed case, so both walk ``object`` and narrow explicitly.
+        "tools/graphql_document.py",
+        "tools/sl1_credential_guard.py",
     }
 )
 

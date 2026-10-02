@@ -368,14 +368,20 @@ if [ ! -f "%{env_file}" ]; then
 # Despite the name, 16 of these 22 use GraphQL, so setting ENABLE_SL1_GRAPHQL_TOOLS=false on its own
 # does not stop GraphQL traffic -- set both keys to false for that.  This set also includes a
 # general-purpose SL1 request tool; what it can reach is limited to whatever the calling user's own
-# SL1 account permits, and every call is audit-logged.  Set this to false to withhold the whole set.
+# SL1 account permits, and every call is audit-logged.  It refuses REST credential resources other
+# than the plain indexes, filters, sorts and link_disp_field values that would reveal a secret on
+# any resource, and withholds secrets from every response.  Set this to false to withhold the whole
+# set.
 #ENABLE_SL1_REST_TOOLS=true
 
-# Register the 2 generic GraphQL tools of the sl1_graphql set.  Default: true.
+# Register the 3 GraphQL passthrough tools of the sl1_graphql set.  Default: true.
 #
 # SL1 applies the calling user's own permissions to GraphQL queries, but NOT to schema
-# introspection: one of these two tools lets any authenticated caller read the entire schema shape,
-# including fields whose data their account cannot query.  Set this to false to withhold that.
+# introspection: one of these three tools lets any authenticated caller read the entire schema
+# shape, including fields whose data their account cannot query.  The arbitrary-query tool refuses
+# documents that would read secrets (inside a credential, only allowlisted metadata may be
+# selected; on any type, secret-named fields are refused) and withholds them from every response.
+# Set this to false to withhold all three.
 #ENABLE_SL1_GRAPHQL_TOOLS=true
 
 # Register the 3 tools of the db_read set, which read the appliance database directly.

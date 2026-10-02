@@ -525,6 +525,10 @@ def create_app(config: Config | None = None) -> ASGIApp:
     #
     # This line is what bounds the shutdown drain; the systemd unit needs no ``TimeoutStopSec``
     # override because of it.
+    #
+    # Outbound calls stop ``OUTBOUND_DEADLINE_MARGIN_SECONDS`` inside this deadline, so a slow
+    # backend returns the tool's own error instead of being cut off here with no reply. The margin
+    # is taken out of the outbound budget, never added to this value.
     app.add_middleware(
         ConcurrencyGateMiddleware,
         limit=resolved.MAX_CONCURRENT_REQUESTS,

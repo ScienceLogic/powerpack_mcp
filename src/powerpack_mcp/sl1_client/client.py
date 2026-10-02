@@ -23,6 +23,7 @@ What this client deliberately does not do:
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 import httpx
@@ -183,9 +184,54 @@ class Sl1Client:
         json_body: object | None,
         raw_body: str | bytes | None = None,
         # Forwarded to httpx as a transport timeout, not used to race a task, so ASYNC109's advice
-        # to prefer ``asyncio.timeout`` does not apply. The request deadline in the gate is the
-        # racing mechanism, deliberately at one site rather than per call.
+        # to prefer ``asyncio.timeout`` does not apply to this parameter. The race is the
+        # ``asyncio.timeout`` below, bounded by the request deadline rather than by this value.
         timeout: float | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any] | list[Any]:
+        """Issue one request and read the body under the response size cap and the deadline.
+
+        The whole exchange, connect to last byte, is bounded by ``outbound_budget_seconds()``: the
+        request deadline less a margin, so this call fails with its own ``Sl1Unreachable`` before
+        the concurrency gate cancels the request and leaves the caller with no reply.
+        ``mcp_app.concurrency`` explains the margin. The httpx timeouts alone cannot do this:
+        they equal the gate's deadline, and the read timeout is per chunk, not total.
+
+        :raises Sl1Unreachable: If the deadline is already spent (nothing is sent), or the budget
+            runs out mid-exchange.
+        """
+        # Function-local because of an import cycle: ``mcp_app/__init__`` imports ``mcp_app.app``,
+        # which imports this module.
+        from powerpack_mcp.mcp_app.concurrency import outbound_budget_seconds
+
+        budget = outbound_budget_seconds()
+        if budget is not None and budget <= 0.0:
+            # Sending would only start work the gate is about to cancel.
+            raise Sl1Unreachable(url.host)
+        try:
+            async with asyncio.timeout(budget):
+                return await self._exchange(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json_body=json_body,
+                    raw_body=raw_body,
+                    transport_timeout=timeout,
+                )
+        except TimeoutError as exc:
+            # The same error an httpx timeout produces, so callers and envelopes are unchanged.
+            raise Sl1Unreachable(url.host) from exc
+
+    async def _exchange(
+        self,
+        *,
+        method: str,
+        url: httpx.URL,
+        headers: dict[str, str],
+        json_body: object | None,
+        raw_body: str | bytes | None,
+        # Named for what it is, httpx's per-call transport timeout, not a deadline to race: the
+        # race is ``_send``'s ``asyncio.timeout``.
+        transport_timeout: float | None,
     ) -> dict[str, Any] | list[Any]:
         """Issue one request and read the body under the response size cap.
 
@@ -195,8 +241,8 @@ class Sl1Client:
 
         :param raw_body: A non-JSON body, sent as content. Mutually exclusive with ``json_body``;
             SL1's async operations take ``application/em7-resource-uri``.
-        :param timeout: Overrides the pool timeout for this call. Already clamped by the caller and
-            never clamped here, so one site decides the ceiling.
+        :param transport_timeout: Overrides the pool timeout for this call. Already clamped by the
+            caller and never clamped here, so one site decides the ceiling.
         :return: The parsed JSON body, or an ``accepted`` summary for an empty ``202``/``204``.
         :raises Sl1HttpError: On a status of 400 or above.
         :raises Sl1Unreachable: On a connect failure, timeout or protocol error.
@@ -208,8 +254,8 @@ class Sl1Client:
             extra["content"] = raw_body
         else:
             extra["json"] = json_body
-        if timeout is not None:
-            extra["timeout"] = timeout
+        if transport_timeout is not None:
+            extra["timeout"] = transport_timeout
         try:
             async with self._client.stream(method, url, headers=headers, **extra) as response:
                 if response.status_code >= 400:

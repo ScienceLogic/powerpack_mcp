@@ -179,9 +179,11 @@ SIMULATE_EVENT: Final = _d(
 GET_COMPONENT_TREE: Final = _d(
     "sl1_get_component_tree",
     frozenset({DB, REST}),
-    "Walk the DCM component tree beneath a root device (read-only), reporting counts by class, "
-    "discovering Dynamic Applications, depth, and any component whose parent is outside the tree.",
-    statements=("resolve_root_did", "read_root_summary", "read_component_map"),
+    "Walk the DCM component tree beneath a root device (read-only), reporting counts by state and "
+    "class and the discovering Dynamic Applications. The root is resolved through REST with the "
+    "caller's credential; components outside the root's organization are only counted, as "
+    "withheld.",
+    statements=("read_root_summary", "read_component_map"),
     source_symbol="tools/collection.py::sl1_get_component_tree",
 )
 

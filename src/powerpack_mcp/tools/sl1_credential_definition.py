@@ -26,6 +26,7 @@ import json
 from typing import Any, Final
 
 __all__ = [
+    "CREDENTIAL_SECRET_KEYS",
     "CRED_REFRESH_DYNAMIC",
     "CRED_REFRESH_STATIC",
     "CRED_SECRET_KEYS",
@@ -57,6 +58,72 @@ CRED_SECRET_KEYS: Final[tuple[str, ...]] = (
     "oauth2ClientSecret",
     "oauth2ResourceOwnerPassword",
     "apikey",
+)
+
+# Every ``Credential.definition`` key known to carry secret material, across all eight credential
+# types: the single source of truth for those names. ``CRED_SECRET_KEYS`` above is the REST v104
+# subset that the write path shapes; this is the read-side superset.
+#
+# This is NOT how the typed readers decide what to return. ``sl1_entity_tools._filter_definition``
+# keeps only allowlisted keys, so a secret missing from this tuple is still withheld there. This
+# tuple serves the places where no allowlist can apply because the credential type is unknown:
+# the response scrub in ``sl1_credential_guard`` and the GraphQL document guard. A denylist has to
+# be complete to be safe, which is why neither of those is the primary control either.
+#
+# The first twenty were observed on an appliance across all eight types. ``authHeader`` and
+# ``tokenKey`` were not observed; they are listed because they were classified safe only from the
+# defaults table below, and ``authHeader`` can carry a literal ``Authorization`` value. Fail closed
+# on ambiguity. ``sshKeyData`` matters most: there is no field named ``pemkey``, so a rule that
+# excluded "password or pemkey" would ship every SSH private key while looking deliberate.
+#
+# The AWS names were measured from the ``credentialFields`` templates. They are not redundant case
+# variants: matching is exact, so ``ProxyPasswd`` and ``proxyPasswd`` are different keys.
+# ``AwsAccessKeyId`` is not flagged ``encryption: true`` by the platform; it is listed as one half
+# of a key pair, on the same fail-closed rule as ``authHeader``.
+CREDENTIAL_SECRET_KEYS: Final[tuple[str, ...]] = (
+    "password",
+    "apikey",
+    "snmpRoCommunity",
+    "snmpRwCommunity",
+    "snmpv3PrivPwd",
+    "proxyPasswd",
+    "requestPasswd",
+    "sshKeyData",
+    "oauth2ClientSecret",
+    "oauth2ResourceOwnerPassword",
+    "oauth2ResourceOwnerAdditionalParams",
+    "httpHeaders",
+    "httpHeader1",
+    "httpHeader2",
+    "curlOptions",
+    "requestSub1",
+    "requestSub2",
+    "requestSub3",
+    "requestSub4",
+    "authOverride",
+    "opts",
+    "authHeader",
+    "tokenKey",
+    "AwsSecretAccessKey",
+    "ProxyPasswd",
+    "AwsAccessKeyId",
+    # Measured from the remaining ``credentialFields`` templates on two appliances: the other
+    # UNIVERSAL subtypes, and the SOAP_XML subtypes, whose field names differ from their type's.
+    # ``AccessKeyId``, ``awsAccessKeyId`` and Aliyun's ``accessKey`` are key ids, listed on the same
+    # rule as ``AwsAccessKeyId``.
+    "cred_pwd",
+    "ssh_key_data",
+    "AccessKeyId",
+    "SecretAccessKey",
+    "EncryptionPassword",
+    "EncryptionSalt",
+    "secret",
+    "vmwareWebServicePassword",
+    "awsAccessKeyId",
+    "awsSecretAccessKey",
+    "azureSecretKey",
+    "accessKey",
+    "accessKeyPassword",
 )
 
 # SL1's full UNIVERSAL definition shape for REST v104. Ported key-for-key; do not trim. A partial

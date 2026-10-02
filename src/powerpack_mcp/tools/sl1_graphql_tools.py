@@ -5,6 +5,11 @@ This module defines ``sl1_graphql``, which runs any caller-supplied query or mut
 ``sl1_graphql_introspect``, which explores the schema in small pieces. Neither takes
 ``target_host``, ``username`` or ``password``; every call uses the caller's forwarded credential.
 
+``sl1_graphql`` refuses, before sending, any document that would read credential or other secrets
+(an allowlist inside credentials, a secret-name rule everywhere), and scrubs every response;
+``sl1_credential_guard`` states the rule. Without that, it would return the
+secrets ``sl1_list_credentials`` and ``sl1_get_credential`` exist to withhold.
+
 SL1 applies the caller's permissions to data queries but not to introspection: a restricted
 account can read the whole schema. That exposes shape, not data, and it is why the shared
 ``_type_names_cache`` is safe. The safety rests on that measurement, not on a guarantee.
@@ -18,8 +23,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final
 
+from powerpack_mcp.errors import ValidationBlocked
 from powerpack_mcp.shaping import shape_response
 from powerpack_mcp.tools import sl1_descriptors as d
+from powerpack_mcp.tools.sl1_credential_guard import (
+    refuse_credential_secret_document,
+    scrub_credential_secrets,
+)
 from powerpack_mcp.tools.sl1_pipeline import audit_passthrough, sl1_tool_boundary
 
 if TYPE_CHECKING:
@@ -151,11 +161,24 @@ def make_sl1_graphql(context: Sl1ToolContext) -> Sl1ToolFactory:
             timeout: Per-call timeout in seconds. Bounded by the service's ceiling; a larger
                 value is clamped, never honoured.
 
-        This tool can run mutations as well as queries.
+        This tool can run mutations as well as queries. It refuses documents that would read
+        secrets: inside a credential only non-secret metadata (id, name, host, snmpVersion, ...)
+        may be selected, secret-named fields (password, token, hash, ...) are refused on any type,
+        and so are searches and sorts on them. Secrets are withheld from every response; use
+        sl1_get_credential or sl1_list_credentials for credentials.
         """
         # Audited as a passthrough. The document is deliberately not logged: it is caller-supplied
         # and may embed credential material in variables, and payload bodies stay out of logs. For
         # GraphQL the audited path is always ``/gql``.
+        try:
+            # Before anything is sent: a refused document must not reach SL1 at all, not merely
+            # have its answer discarded.
+            refuse_credential_secret_document(query, variables)
+        except ValidationBlocked:
+            audit_passthrough(
+                d.GRAPHQL_QUERY, method="POST", path="/gql", outcome="rejected_credential_secret"
+            )
+            raise
         audit_passthrough(d.GRAPHQL_QUERY, method="POST", path="/gql", outcome="invoked")
         body = await context.client.graphql(
             credential=context.credential_source(),
@@ -164,7 +187,10 @@ def make_sl1_graphql(context: Sl1ToolContext) -> Sl1ToolFactory:
             operation_name=operation_name,
             timeout=timeout,
         )
-        return _pruned(body) if prune else body
+        # The scrub runs before pruning and whether or not pruning is asked for: ``prune=False``
+        # changes which empty values survive, never which secrets do.
+        scrubbed = scrub_credential_secrets(body)
+        return _pruned(scrubbed) if prune else scrubbed
 
     return sl1_graphql
 

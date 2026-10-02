@@ -18,6 +18,7 @@ import pytest
 
 from powerpack_mcp import config as config_module
 from powerpack_mcp.config import (
+    OUTBOUND_DEADLINE_MARGIN_SECONDS,
     READ_TIMEOUT_CEILING_SECONDS,
     TOOL_SET_FLAG_KEYS,
     Config,
@@ -161,10 +162,16 @@ class TestTimeouts:
         with pytest.raises(ValueError, match="TimeoutStopSec"):
             Config(LCE_READ_TIMEOUT_SECONDS=300.0)
 
-    @pytest.mark.parametrize("value", [0.0, -1.0])
-    def test_non_positive_rejected(self, value: float) -> None:
-        with pytest.raises(ValueError, match="greater than 0"):
+    @pytest.mark.parametrize("value", [0.0, -1.0, 1.0, OUTBOUND_DEADLINE_MARGIN_SECONDS])
+    def test_a_timeout_the_outbound_margin_would_consume_is_rejected(self, value: float) -> None:
+        """At or below the margin every outbound call would be refused unsent, so startup fails."""
+        with pytest.raises(ValueError, match="greater than"):
             Config(LCE_READ_TIMEOUT_SECONDS=value)
+
+    def test_a_timeout_just_above_the_margin_is_accepted(self) -> None:
+        value = OUTBOUND_DEADLINE_MARGIN_SECONDS + 0.5
+        cfg = Config(LCE_READ_TIMEOUT_SECONDS=value, LCE_CONNECT_TIMEOUT_SECONDS=1.0)
+        assert value == cfg.LCE_READ_TIMEOUT_SECONDS
 
     @pytest.mark.parametrize("key", ["LCE_CONNECT_TIMEOUT_SECONDS", "LCE_READ_TIMEOUT_SECONDS"])
     @pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "infinity"])

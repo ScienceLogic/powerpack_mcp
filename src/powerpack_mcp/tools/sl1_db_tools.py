@@ -295,23 +295,26 @@ def make_sl1_simulate_event(context: Sl1DbToolContext) -> DbToolFactory:
     return sl1_simulate_event
 
 
-async def _resolve_root_did(db: DbClient, root: str) -> int:
-    """Resolve the component-tree ``root`` argument to a device id.
+async def _resolve_root_did(context: Sl1DbToolContext, root: str) -> int:
+    """Resolve the component-tree ``root`` argument to a device id the caller may see.
 
-    :param db: The database client.
+    Through REST with the caller's credential, never SQL, and before any statement runs for the
+    root. The database connection is the service's own and sees every organization; REST applies
+    SL1's organization ACL to the caller, so a root in an organization the caller cannot see is a
+    403 or 404 that raises ``Sl1HttpError`` here and the tool issues no SQL at all. A numeric id is
+    checked too, rather than trusted because no lookup is needed to learn the number.
+
+    A name must match exactly, as it always has for this tool: ``vcenter`` does not walk
+    ``vcenter-old``'s tree.
+
+    :param context: The tool context.
     :param root: A numeric device id or an exact device name.
     :return: The root device id.
-    :raises ValidationBlocked: If no device has that name.
+    :raises ValidationBlocked: If ``root`` is empty or no visible device has that exact name.
+    :raises Sl1HttpError: If SL1 refuses the lookup, as it does for a device the caller cannot see.
     """
-    text = root.strip()
-    # ``isdecimal()``, not ``isdigit()``; see ``coded()``.
-    if text.isdecimal():
-        return int(text)
-    # Resolved in Python, so there is no ``SET @root`` session-state dependency.
-    resolved = one_value(await db.fetch_all(q.resolve_root_did_by_name(text)))
-    if resolved is None:
-        raise refuse("root", f"No device named {root!r} exists.")
-    return as_int(resolved, argument="root")
+    did, _name = await resolve_device(context, root, exact=True, argument="root")
+    return did
 
 
 async def _read_root_summary(db: DbClient, root: str, root_did: int) -> tuple[object, object]:
@@ -339,7 +342,7 @@ def _tally_components(
 ) -> tuple[dict[str, int], dict[str, int], set[str]]:
     """Count components by state and by class, and collect the discovering Dynamic Applications.
 
-    :param components: The component rows, as ``_rows_as_dicts`` returns them.
+    :param components: The in-scope component rows, as ``_rows_as_dicts`` returns them.
     :return: ``(by_state, by_class, discovering)``.
     """
     by_state: dict[str, int] = {}
@@ -356,6 +359,20 @@ def _tally_components(
     return by_state, by_class, discovering
 
 
+def _split_withheld(rows: tuple[Row, ...]) -> tuple[tuple[Row, ...], int]:
+    """Separate the in-scope component rows from the withheld ones.
+
+    ``read_component_map`` returns a withheld component as a row whose id, and every other column,
+    is NULL, so the id alone decides. Only the count of withheld rows survives; there is nothing
+    else in them to keep.
+
+    :param rows: The ``read_component_map`` result.
+    :return: ``(in_scope_rows, withheld_count)``.
+    """
+    in_scope = tuple(row for row in rows if row and row[0] is not None)
+    return in_scope, len(rows) - len(in_scope)
+
+
 def make_sl1_get_component_tree(context: Sl1DbToolContext) -> DbToolFactory:
     """Build the ``sl1_get_component_tree`` tool bound to ``context``.
 
@@ -367,13 +384,19 @@ def make_sl1_get_component_tree(context: Sl1DbToolContext) -> DbToolFactory:
     async def sl1_get_component_tree(root: str, max_nodes: int = 2000) -> dict[str, Any]:
         """Walk the DCM component tree beneath a root device (read-only).
 
-        Reports the root, totals by state, the Dynamic Applications doing the discovering, the
-        maximum depth, counts by device class, and every component with its parent so the caller can
-        reconstruct the tree. Components whose parent is not itself in the subtree are reported
-        separately rather than dropped.
+        Reports the root, totals by state, counts by device class, the Dynamic Applications doing
+        the discovering, and every component with its parent so the caller can reconstruct the
+        tree. Components are listed in parent order, not nested.
+
+        The root is checked against the caller's SL1 access first: a root in an organization the
+        caller cannot see fails with SL1's own 403 or 404, and nothing is read. Components are then
+        limited to the root's organization, active or vanished. Any other component, and any with
+        no device record (whose organization cannot be confirmed), is left out of every list and
+        count and only tallied in withheld_components. A listed component whose parent is outside
+        that scope has parent_did null.
 
         Args:
-            root: Root device id, or a device name to resolve through REST.
+            root: Root device id, or an exact device name, resolved through REST.
             max_nodes: Cap on components returned. A large root can have thousands; the total is
                 always reported, so a truncated answer is distinguishable from a complete one.
 
@@ -383,10 +406,12 @@ def make_sl1_get_component_tree(context: Sl1DbToolContext) -> DbToolFactory:
             raise refuse("max_nodes", "max_nodes must be at least 1.")
         db = context.require_db()
 
-        root_did = await _resolve_root_did(db, root)
+        # REST first, with the caller's credential: no statement below runs for a root the caller's
+        # account cannot see. See ``_resolve_root_did``.
+        root_did = await _resolve_root_did(context, root)
         root_name, root_class = await _read_root_summary(db, root, root_did)
 
-        rows = await db.fetch_all(q.read_component_map(root_did))
+        rows, withheld = _split_withheld(await db.fetch_all(q.read_component_map(root_did)))
         components = _rows_as_dicts(
             rows,
             ("did", "parent_did", "name", "device_class", "state", "unique_id", "aid", "last_seen"),
@@ -399,6 +424,9 @@ def make_sl1_get_component_tree(context: Sl1DbToolContext) -> DbToolFactory:
             "by_state": by_state,
             "counts_by_class": dict(sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))),
             "discovering_dynamic_apps": sorted(discovering),
+            # A count only, never which components: the caller learns that the tree is not the
+            # whole map, and nothing about what the rest is.
+            "withheld_components": withheld,
             "truncated": len(components) > max_nodes,
             "components": components[:max_nodes],
         }
@@ -660,10 +688,11 @@ def make_sl1_get_device_class_alignment(context: Sl1DbToolContext) -> DbToolFact
 # 6.0 s, so sub-second polling would add load for nothing.
 _POLL_INTERVAL_SECONDS: Final[float] = 1.0
 
-# Head-room left on the request deadline. ``db_client`` clamps every statement to what the deadline
-# has left, and a ``0.0`` remainder becomes ``max_statement_time = 0.001`` (errno 1969, a
-# ``DbQueryTimeout``), so polling to the very end would turn "still running" into a spurious
-# timeout on the last read.
+# Head-room left on the request deadline. ``db_client`` clamps every statement to the outbound
+# budget, the deadline's remainder less ``OUTBOUND_DEADLINE_MARGIN_SECONDS`` (2 s), and refuses a
+# statement once that budget is spent, so polling to the very end would turn "still running" into a
+# spurious failure on the last read. This must stay larger than that margin; at 3 s the last poll
+# still has about 1 s of statement budget.
 _DEADLINE_MARGIN_SECONDS: Final[float] = 3.0
 
 # Ceiling when no inbound deadline is in force, e.g. a unit test or a non-POST path, where

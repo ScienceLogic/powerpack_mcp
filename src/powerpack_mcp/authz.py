@@ -10,8 +10,13 @@ their own forwarded credential through ``GET /api/account/_self/access_hooks`` (
 
 Constraints a maintainer must keep:
 
-- A tool absent from the registry is refused. There is no wildcard, no fallback and no "allow if
-  unmapped" branch.
+- There is no wildcard, no fallback and no "allow if unmapped" branch: ``registry_entry`` refuses
+  a tool that is absent or withheld (``DbToolNotRegistered``), and the gate refuses a gated tool
+  with no mapping (``mcp_app.authz_gate.ToolNotMapped``). That is not a refusal of every tool this
+  registry omits. The gate covers only the SQL tools (``mcp_app.authz_gate.is_gated``); a tool
+  absent from the registry is not gated at all, by design, because it reaches SL1 or LCE with the
+  caller's own credential and the backend authorizes it. Hooks never limit what such a tool
+  returns: credential secrets on the passthroughs are kept out by ``tools.sl1_credential_guard``.
 - Only SQL tools carry hook mappings. MariaDB enforces the service database user's grants, not SL1
   hooks, so nothing downstream catches a mapping error and an over-permissive entry fails
   silently. This mapping is the only specification of correct access for these tools.
@@ -201,9 +206,10 @@ _ENTRIES: Final[tuple[ToolRegistryEntry, ...]] = (
     # Uses SL1's supported REST endpoint (``DELETE event/{id}``), not a direct SQL write, so it
     # needs no database.
     _entry("sl1_clear_event", ToolTransport.REST, writes=True),
-    # Reads ``master_dev.component_dev_map`` joined to ``legend_device`` and
-    # ``legend_device_vanished``, plus ``master.definitions_dev_classes`` for the class label,
-    # hence three hooks. Refusal is not verified against a live restricted account.
+    # Reads ``master_dev.component_dev_map`` joined to ``legend_device``, plus
+    # ``master.definitions_dev_classes`` for the class label, hence three hooks. Refusal is not
+    # verified against a live restricted account. These hooks are account-wide; which root the
+    # caller may see is decided by SL1's REST ACL, which the tool consults before any SQL.
     _entry(
         "sl1_get_component_tree",
         ToolTransport.SQL,

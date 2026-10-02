@@ -432,29 +432,75 @@ class TestSimulateEvent:
         assert_refused(result)
 
 
+# A component `read_component_map` withheld: out of the root's organization, or with no device
+# row, active or vanished. The SQL masks every column, so this is all a withheld row ever carries.
+_WITHHELD_ROW: tuple[None, ...] = (None,) * 8
+
+
 class TestGetComponentTree:
-    async def test_a_numeric_root_skips_the_name_lookup(self) -> None:
+    async def test_a_numeric_root_is_confirmed_through_rest_before_any_sql(self) -> None:
+        """A numeric root is not trusted because no lookup is needed to learn the number.
+
+        The database connection sees every organization, so skipping REST for a digit string let a
+        caller walk any organization's tree. `GET device/<id>` with the caller's credential is what
+        applies SL1's organization ACL.
+        """
+        sl1 = FakeSl1(rest_results=[{"name": "vcenter"}])
         db = FakeDb(fetch_results=[(("vcenter", "VMware | vCenter"),), ()])
-        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db, sl1=sl1))
         result = await call(tool, root="42")
-        # Two statements: summary and map. The name resolution is skipped entirely rather than
-        # round-tripping to learn what the caller already told us.
-        assert len(db.statements) == 2
+        assert [c["path"] for c in sl1.rest_calls] == ["device/42"]
+        # Two statements: summary and map, both bound to the REST-confirmed id.
+        assert [params for _, params in db.statements] == [(42, 42), (42,)]
         assert result["root"]["did"] == 42
 
-    async def test_a_named_root_resolves_first(self) -> None:
-        db = FakeDb(fetch_results=[((42,),), (("vcenter", "VMware | vCenter"),), ()])
-        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+    async def test_a_named_root_resolves_through_rest_not_sql(self) -> None:
+        sl1 = FakeSl1(rest_results=[{"/api/device/42": {"description": "vcenter-1"}}])
+        db = FakeDb(fetch_results=[(("vcenter-1", "VMware | vCenter"),), ()])
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db, sl1=sl1))
         result = await call(tool, root="vcenter-1")
-        assert len(db.statements) == 3
-        assert db.statements[0][1] == ("vcenter-1",)
+        assert sl1.rest_calls[0]["path"] == "device"
+        assert sl1.rest_calls[0]["query"]["filter.name.contains"] == "vcenter-1"
+        # No SQL name lookup: the name never reaches a statement.
+        assert len(db.statements) == 2
+        assert all("vcenter-1" not in params for _, params in db.statements)
         assert result["root"]["did"] == 42
 
-    async def test_an_unresolvable_root_is_refused(self) -> None:
-        db = FakeDb(fetch_results=[()])
-        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+    async def test_an_unresolvable_root_is_refused_before_any_sql(self) -> None:
+        db = FakeDb()
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](
+            make_context(db=db, sl1=FakeSl1(rest_results=[{}]))
+        )
         result = await call(tool, root="does-not-exist")
-        assert_refused(result)
+        assert_refused(result, "no device named")
+        assert db.statements == []
+
+    async def test_a_name_that_only_contains_the_root_is_refused(self) -> None:
+        """`root` has always meant an exact name; a substring match walks someone else's tree."""
+        sl1 = FakeSl1(rest_results=[{"/api/device/43": {"description": "vcenter-1-old"}}])
+        db = FakeDb()
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db, sl1=sl1))
+        result = await call(tool, root="vcenter-1")
+        assert_refused(result, "no device named")
+        assert db.statements == []
+
+    @pytest.mark.parametrize("status", [403, 404])
+    @pytest.mark.parametrize("root", ["42", "vcenter-1"])
+    async def test_a_root_rest_refuses_stops_the_tool_with_no_sql(
+        self, status: int, root: str
+    ) -> None:
+        """SL1 answers 403 or 404 for a device in an organization the caller cannot see.
+
+        That error is the access decision, so it must reach the caller as SL1's own and no
+        statement may run for the root, whichever form the root was given in.
+        """
+        db = FakeDb(fetch_results=[(("vcenter", "VMware | vCenter"),), ()])
+        sl1 = RaisingSl1(rest_error=Sl1HttpError(status, {"message": "denied"}))
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db, sl1=sl1))
+        result = await call(tool, root=root)
+        assert result["error"]["type"] == "sl1_http_error", result
+        assert result["error"]["sl1_status"] == status
+        assert db.statements == []
 
     async def test_truncation_is_reported_rather_than_silent(self) -> None:
         """A truncated answer otherwise looks exactly like a complete one."""
@@ -469,15 +515,87 @@ class TestGetComponentTree:
     async def test_states_and_classes_are_counted(self) -> None:
         components = (
             (1, 42, "a", "Class A", "active", "u1", "7", "0"),
-            (2, 42, "b", "Class A", "vanished", "u2", "7", "0"),
+            (2, 42, "b", "Class A", "active", "u2", "7", "0"),
             (3, 42, "c", "Class B", "active", "u3", "8", "0"),
         )
         db = FakeDb(fetch_results=[(("root", "Class"),), components])
         tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
         result = await call(tool, root="42")
-        assert result["by_state"] == {"active": 2, "vanished": 1}
+        assert result["by_state"] == {"active": 3}
         assert result["counts_by_class"] == {"Class A": 2, "Class B": 1}
         assert result["discovering_dynamic_apps"] == ["7", "8"]
+        assert result["withheld_components"] == 0
+
+    async def test_withheld_components_are_counted_and_nothing_else(self) -> None:
+        """An out-of-organization or unregistered component affects only the count.
+
+        It must not appear in `components`, and must not move `total_components`, `by_state`,
+        `counts_by_class` or `discovering_dynamic_apps` either: a count keyed by class or a
+        Dynamic Application id would itself disclose something about it.
+        """
+        components = (
+            (1, 42, "a", "Class A", "active", "u1", "7", "0"),
+            _WITHHELD_ROW,
+            (3, 42, "c", "Class B", "active", "u3", "8", "0"),
+            _WITHHELD_ROW,
+        )
+        db = FakeDb(fetch_results=[(("root", "Class"),), components])
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+        result = await call(tool, root="42", max_nodes=1)
+        assert result["withheld_components"] == 2
+        assert result["total_components"] == 2
+        assert result["by_state"] == {"active": 2}
+        assert result["counts_by_class"] == {"Class A": 1, "Class B": 1}
+        assert result["discovering_dynamic_apps"] == ["7", "8"]
+        # Truncation is judged against the in-scope components only.
+        assert result["truncated"] is True
+        assert [c["did"] for c in result["components"]] == [1]
+
+    async def test_a_tree_of_only_withheld_components_reads_as_empty_with_a_count(self) -> None:
+        db = FakeDb(fetch_results=[(("root", "Class"),), (_WITHHELD_ROW,)])
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+        result = await call(tool, root="42")
+        assert result["components"] == []
+        assert result["total_components"] == 0
+        assert result["by_state"] == {}
+        assert result["withheld_components"] == 1
+        assert result["truncated"] is False
+
+    async def test_an_out_of_scope_parent_reads_as_null_and_the_component_stays(self) -> None:
+        """`read_component_map` masks a parent outside the root's organization to NULL.
+
+        The component itself is in scope, so it is listed and counted; only its parent's id is
+        unknown to the caller, and it is not counted as withheld.
+        """
+        components = (
+            (1, 42, "a", "Class A", "active", "u1", "7", "0"),
+            (2, None, "b", "Class A", "active", "u2", "7", "0"),
+            (3, 0, "c", "Class B", "vanished", "u3", "8", "0"),
+        )
+        db = FakeDb(fetch_results=[(("root", "Class"),), components])
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+        result = await call(tool, root="42")
+        assert [(c["did"], c["parent_did"]) for c in result["components"]] == [
+            (1, 42),
+            (2, None),
+            (3, 0),
+        ]
+        assert result["total_components"] == 3
+        assert result["withheld_components"] == 0
+
+    async def test_an_in_scope_vanished_component_is_listed_not_withheld(self) -> None:
+        # `legend_device_vanished` carries `roa_id`, so a vanished component is scoped like an
+        # active one rather than withheld for want of an organization.
+        components = (
+            (1, 42, "a", "Class A", "active", "u1", "7", "0"),
+            (2, 42, "b", "Class A", "vanished", "u2", "7", "0"),
+        )
+        db = FakeDb(fetch_results=[(("root", "Class"),), components])
+        tool = reg._FACTORY_FOR["sl1_get_component_tree"](make_context(db=db))
+        result = await call(tool, root="42")
+        assert result["by_state"] == {"active": 1, "vanished": 1}
+        assert result["withheld_components"] == 0
+        assert [c["state"] for c in result["components"]] == ["active", "vanished"]
 
 
 class TestCreateDeviceClass:
@@ -1484,6 +1602,49 @@ class TestResolveDevice:
     async def test_an_empty_device_is_refused(self) -> None:
         with pytest.raises(ValidationBlocked):
             await resolve_device(make_context(), "   ")
+
+    async def test_an_exact_name_is_preferred_over_the_first_link(self) -> None:
+        """A contains search returns `edge-01-old` for `edge-01`, possibly first."""
+        index = {
+            "/api/device/76": {"description": "edge-01-old"},
+            "/api/device/77": {"description": "edge-01"},
+        }
+        context = make_context(sl1=FakeSl1(rest_results=[index]))
+        assert await resolve_device(context, "edge-01") == (77, "edge-01")
+
+    async def test_a_case_insensitive_exact_name_beats_a_substring(self) -> None:
+        # The SQL lookup this replaced compared under MariaDB's case-insensitive collation.
+        index = {
+            "/api/device/76": {"description": "Edge-01-old"},
+            "/api/device/77": {"description": "Edge-01"},
+        }
+        context = make_context(sl1=FakeSl1(rest_results=[index]))
+        assert await resolve_device(context, "edge-01") == (77, "Edge-01")
+
+    async def test_a_substring_match_is_still_accepted_by_default(self) -> None:
+        """Existing callers keep resolving a partial name to the first device SL1 returns."""
+        index = {"/api/device/76": {"description": "edge-01-old"}}
+        context = make_context(sl1=FakeSl1(rest_results=[index]))
+        assert await resolve_device(context, "edge-01") == (76, "edge-01-old")
+
+    async def test_exact_refuses_a_substring_match_under_the_given_argument(self) -> None:
+        index = {"/api/device/76": {"description": "edge-01-old"}}
+        context = make_context(sl1=FakeSl1(rest_results=[index]))
+        with pytest.raises(ValidationBlocked) as excinfo:
+            await resolve_device(context, "edge-01", exact=True, argument="root")
+        assert excinfo.value.findings[0].path == "root"
+        assert_finding(excinfo, "no device named")
+
+    async def test_a_link_without_a_description_is_never_an_exact_match(self) -> None:
+        """Its name would only be the search text echoed back, which proves nothing."""
+        context = make_context(sl1=FakeSl1(rest_results=[{"/api/device/76": {}}]))
+        with pytest.raises(ValidationBlocked):
+            await resolve_device(context, "edge-01", exact=True)
+
+    async def test_an_index_that_is_not_a_mapping_resolves_nothing(self) -> None:
+        context = make_context(sl1=FakeSl1(rest_results=[["/api/device/76"]]))
+        with pytest.raises(ValidationBlocked):
+            await resolve_device(context, "edge-01")
 
 
 class TestOneValue:

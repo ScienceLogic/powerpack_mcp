@@ -36,6 +36,7 @@ __all__ = [
     "LOG_FORMAT",
     "MAX_CONCURRENT_REQUESTS_CEILING",
     "MIN_CONCURRENT_REQUESTS",
+    "OUTBOUND_DEADLINE_MARGIN_SECONDS",
     "POOL_KEEPALIVE_EXPIRY_SECONDS",
     "POOL_MAX_CONNECTIONS",
     "POOL_MAX_KEEPALIVE_CONNECTIONS",
@@ -74,6 +75,25 @@ _VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset(
 # 90s; 5s of margin absorbs process teardown. Above this, systemd would SIGKILL the process
 # mid-drain and cancel in-flight writes.
 READ_TIMEOUT_CEILING_SECONDS: Final[float] = 85.0
+
+# How much earlier than the request deadline every outbound call (SL1, LCE, MariaDB) must give up.
+#
+# The gate's deadline and the outbound timeouts are all ``LCE_READ_TIMEOUT_SECONDS``, so without a
+# margin they expire at the same instant and the gate wins by milliseconds: it cancels the handler
+# just before the tool would have returned its structured ``*_unreachable`` error, and with a
+# streamed response already started the client is left waiting for a reply that never comes. With
+# the margin the outbound call fails first, the tool returns its normal error envelope, and the gate
+# only fires for work that overruns for some other reason.
+#
+# The margin has to cover what happens outside the outbound call but inside the gate: the time
+# between the gate arming its deadline and ``RequestDeadlineMiddleware`` re-arming the per-call one
+# (body read, JSON-RPC parse, session dispatch; normally milliseconds), building the error envelope,
+# and writing the response event. 2 s covers that with a wide allowance while costing the outbound
+# call only about 7% of the 30 s default and about 2% of the 85 s ceiling. It is subtracted from the
+# deadline rather than added to the gate's, because the gate's deadline is the shutdown budget
+# (``mcp_app.app``) and may not grow. ``LCE_READ_TIMEOUT_SECONDS`` must exceed it, or every outbound
+# call would be refused before it was sent; the validator below fails startup instead.
+OUTBOUND_DEADLINE_MARGIN_SECONDS: Final[float] = 2.0
 
 # Pool sizes are code constants, not configuration keys: there is no correct operator-facing value
 # to document.
@@ -349,8 +369,13 @@ class Config(BaseModel):
     @field_validator("LCE_READ_TIMEOUT_SECONDS")
     @classmethod
     def _check_read_timeout(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError(f"must be greater than 0, got {value}")
+        if value <= OUTBOUND_DEADLINE_MARGIN_SECONDS:
+            raise ValueError(
+                f"must be greater than {OUTBOUND_DEADLINE_MARGIN_SECONDS} seconds, got {value}. "
+                "Outbound calls stop that long before the request deadline so a slow backend "
+                "returns an error instead of a dropped response; at or below it every call "
+                "would be refused before being sent"
+            )
         if value > READ_TIMEOUT_CEILING_SECONDS:
             raise ValueError(
                 f"must be at most {READ_TIMEOUT_CEILING_SECONDS} seconds, got {value}. This "

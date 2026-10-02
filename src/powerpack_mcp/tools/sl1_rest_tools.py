@@ -8,8 +8,10 @@ GraphQL and live in ``sl1_entity_tools``.
 
 No tool takes ``target_host``, ``username`` or ``password``: every call uses the caller's
 forwarded credential against the configured host. Paths and methods come from
-``sl1_descriptors``. Tool docstrings are written out in full because an f-string is not a
-docstring and would leave ``__doc__`` as ``None``, removing the tool's description.
+``sl1_descriptors``. The four passthroughs refuse credential resources other than the plain
+indexes and scrub every response for credential secrets; ``sl1_credential_guard`` states the rule.
+Tool docstrings are written out in full because an f-string is not a docstring and would leave
+``__doc__`` as ``None``, removing the tool's description.
 """
 
 from __future__ import annotations
@@ -20,6 +22,10 @@ from typing import TYPE_CHECKING, Any
 from powerpack_mcp.errors import FindingCode, ValidationBlocked, ValidationFinding
 from powerpack_mcp.shaping import shape_response
 from powerpack_mcp.tools import sl1_descriptors as d
+from powerpack_mcp.tools.sl1_credential_guard import (
+    check_rest_credential_access,
+    shape_rest_response,
+)
 from powerpack_mcp.tools.sl1_pipeline import audit_passthrough, sl1_tool_boundary
 
 if TYPE_CHECKING:
@@ -87,6 +93,31 @@ def _encoded_body(body: Any | None, content_type: str) -> tuple[object | None, s
     return json_body, raw_body
 
 
+def _check_credential_access(
+    descriptor: d.Sl1OperationDescriptor, method: str, path: str, query: dict[str, str]
+) -> None:
+    """Apply ``sl1_credential_guard``'s REST rule, auditing a refusal before raising it.
+
+    Audited for the same reason a rejected verb is: the refused calls are the interesting ones to
+    anyone reviewing the trail. The search and describe tools address a path refusal to
+    ``resource``, their name for the path, and search addresses a query refusal to ``filters``,
+    from which its ``filter.``/``order.`` parameters are built.
+
+    :raises ValidationBlocked: If the call would read or change credential secrets.
+    """
+    try:
+        check_rest_credential_access(
+            method,
+            path,
+            query,
+            argument="path" if descriptor is d.REST_REQUEST else "resource",
+            query_argument="filters" if descriptor is d.REST_SEARCH else None,
+        )
+    except ValidationBlocked:
+        audit_passthrough(descriptor, method=method, path=path, outcome="rejected_credential_path")
+        raise
+
+
 def make_sl1_rest_request(context: Sl1ToolContext) -> Sl1ToolFactory:
     """Build the ``sl1_rest_request`` passthrough bound to ``context``.
 
@@ -129,7 +160,11 @@ def make_sl1_rest_request(context: Sl1ToolContext) -> Sl1ToolFactory:
             timeout: Per-call timeout in seconds. Bounded by the service's ceiling; a larger
                 value is clamped, never honoured.
 
-        This tool can create, update and delete.
+        This tool can create, update and delete. Credential resources are refused except the
+        plain credential and credential/<type> indexes, and secrets are withheld from every
+        response; use sl1_get_credential or sl1_list_credentials. On any resource, filter. and
+        order. on a secret field are refused, and link_disp_field may name only a plain display
+        field such as name or description.
         """
         verb = method.upper()
         if verb not in d.ALLOWED_METHODS:
@@ -150,6 +185,8 @@ def make_sl1_rest_request(context: Sl1ToolContext) -> Sl1ToolFactory:
                 ]
             )
 
+        query = _stringify_query(query_params or {})
+        _check_credential_access(d.REST_REQUEST, verb, path, query)
         json_body, raw_body = _encoded_body(body, content_type)
 
         audit_passthrough(d.REST_REQUEST, method=verb, path=path, outcome="invoked")
@@ -157,13 +194,16 @@ def make_sl1_rest_request(context: Sl1ToolContext) -> Sl1ToolFactory:
             credential=context.credential_source(),
             method=verb,  # type: ignore[arg-type]  # narrowed by ALLOWED_METHODS above
             path=path,
-            query=_stringify_query(query_params or {}),
+            query=query,
             json_body=json_body,
             raw_body=raw_body,
             content_type=content_type,
             timeout=timeout,
         )
-        return _pruned(result) if prune else result
+        # Shaped before pruning and whether or not pruning is asked for: ``prune=False`` changes
+        # which empty values survive, never which secrets do.
+        shaped = shape_rest_response(path, result)
+        return _pruned(shaped) if prune else shaped
 
     return sl1_rest_request
 
@@ -179,11 +219,14 @@ def make_sl1_rest_index(context: Sl1ToolContext) -> Sl1ToolFactory:
         sl1_rest_describe on a resource name from this list to see its fields and filters.
         """
         audit_passthrough(d.REST_INDEX, method=d.REST_INDEX.method, path="", outcome="invoked")
-        return await context.client.request(
+        listed = await context.client.request(
             credential=context.credential_source(),
             method=d.REST_INDEX.method,
             path=d.REST_INDEX.path_base,
         )
+        # The API root lists resource names and carries no credential, but every passthrough
+        # response goes through the same scrub so none can be the one that was forgotten.
+        return shape_rest_response(d.REST_INDEX.path_base, listed)
 
     return sl1_rest_index
 
@@ -202,17 +245,20 @@ def make_sl1_rest_describe(context: Sl1ToolContext) -> Sl1ToolFactory:
             resource: A resource type name, as listed by sl1_rest_index -- for example device,
                 dynamic_app, organization.
         """
+        # ``limit=0`` asks for the description without rows; ``hide_filterinfo=0`` includes the
+        # filter metadata, which is the point of this tool.
+        query = _stringify_query({"limit": 0, "hide_filterinfo": 0})
+        _check_credential_access(d.REST_DESCRIBE, d.REST_DESCRIBE.method, resource, query)
         audit_passthrough(
             d.REST_DESCRIBE, method=d.REST_DESCRIBE.method, path=resource, outcome="invoked"
         )
-        return await context.client.request(
+        described = await context.client.request(
             credential=context.credential_source(),
             method=d.REST_DESCRIBE.method,
             path=resource,
-            # ``limit=0`` asks for the description without rows; ``hide_filterinfo=0`` includes the
-            # filter metadata, which is the point of this tool.
-            query=_stringify_query({"limit": 0, "hide_filterinfo": 0}),
+            query=query,
         )
+        return shape_rest_response(resource, described)
 
     return sl1_rest_describe
 
@@ -256,15 +302,18 @@ def make_sl1_rest_search(context: Sl1ToolContext) -> Sl1ToolFactory:
         if extended_fetch:
             params["extended_fetch"] = 1
 
+        query = _stringify_query(params)
+        _check_credential_access(d.REST_SEARCH, d.REST_SEARCH.method, resource, query)
         audit_passthrough(
             d.REST_SEARCH, method=d.REST_SEARCH.method, path=resource, outcome="invoked"
         )
-        return await context.client.request(
+        found = await context.client.request(
             credential=context.credential_source(),
             method=d.REST_SEARCH.method,
             path=resource,
-            query=_stringify_query(params),
+            query=query,
         )
+        return shape_rest_response(resource, found)
 
     return sl1_rest_search
 

@@ -226,24 +226,43 @@ def refuse(path: str, message: str) -> ValidationBlocked:
     )
 
 
-async def resolve_device(context: Sl1DbToolContext, device: str) -> tuple[int, str]:
+async def resolve_device(
+    context: Sl1DbToolContext, device: str, *, exact: bool = False, argument: str = "device"
+) -> tuple[int, str]:
     """Resolve a device id or name to ``(did, name)`` through REST.
 
     Unlike the reference implementation, this raises rather than returning an error string, so a
     forgotten check cannot read as success, and it returns ``did`` as an ``int`` so SQL tools bind
     an integer parameter without each remembering the cast.
 
+    Both branches use the caller's forwarded credential, so SL1's own organization ACL decides
+    whether the device is visible. That is the point of resolving here rather than in SQL: a 403 or
+    404 raises ``Sl1HttpError`` before the caller's tool has issued any statement for the device.
+
     The name search deliberately omits ``extended_fetch``: only the id is needed, and
     ``extended_fetch=1`` would fetch full records for up to five devices per resolution.
 
+    A name search is a ``contains`` search, so it can return several devices. A device whose name
+    equals ``device`` exactly is preferred over the order SL1 happened to return them in; see
+    ``_first_indexed_device``. With ``exact`` off a substring match is still accepted when nothing
+    matches exactly, which is how every caller other than ``sl1_get_component_tree`` has always
+    behaved. With ``exact`` on it is refused, because that tool's ``root`` has always meant an exact
+    device name.
+
     :param context: The tool context.
-    :param device: A numeric device id or a device name substring.
+    :param device: A numeric device id or a device name (a substring unless ``exact``).
+    :param exact: Refuse a name that matches no device exactly, rather than taking a substring
+        match.
+    :param argument: The argument path the refusal names, for a caller whose parameter is not
+        called ``device``.
     :return: ``(did, name)``.
     :raises ValidationBlocked: If ``device`` is empty or does not resolve.
+    :raises Sl1HttpError: If SL1 refuses the lookup, including a 403 or 404 for a device the
+        caller's account cannot see.
     """
     value = device.strip()
     if not value:
-        raise refuse("device", "device must not be empty.")
+        raise refuse(argument, f"{argument} must not be empty.")
 
     credential = context.credential_source()
     # ``isdecimal()``, not ``isdigit()``; see ``coded()``.
@@ -260,28 +279,68 @@ async def resolve_device(context: Sl1DbToolContext, device: str) -> tuple[int, s
         path="device",
         query={"filter.name.contains": value, "hide_filterinfo": "1", "limit": "5"},
     )
-    matched = _first_indexed_device(index, value)
+    matched = _first_indexed_device(index, value, exact=exact)
     if matched is not None:
         return matched
-    raise refuse("device", f"Could not resolve device {device!r} through the SL1 REST API.")
+    if exact:
+        raise refuse(
+            argument,
+            f"No device named {device!r} is visible through the SL1 REST API. The name must match "
+            "exactly; pass the numeric device id if several devices share this name as a prefix.",
+        )
+    raise refuse(argument, f"Could not resolve device {device!r} through the SL1 REST API.")
 
 
-def _first_indexed_device(index: object, value: str) -> tuple[int, str] | None:
-    """Return ``(did, name)`` for the first device link in a REST ``device`` index, if any.
+def _indexed_devices(index: object) -> list[tuple[int, str | None]]:
+    """Return ``(did, description)`` for every device link in a REST ``device`` index, in order.
 
     :param index: The decoded ``GET device`` response.
-    :param value: The stripped search text, used as the name when a link has no description.
-    :return: ``(did, name)``, or ``None`` when the index holds no device link.
+    :return: The links, with ``None`` for a link that carries no description.
     """
     if not isinstance(index, dict):
-        return None
+        return []
+    links: list[tuple[int, str | None]] = []
     for uri, link in index.items():
         candidate = uri.rstrip("/").split("/")[-1]
         # ``isdecimal()``, as at every other numeric-branch selector; see ``coded()``.
         if "/device/" in uri and candidate.isdecimal():
             described = link.get("description") if isinstance(link, dict) else None
-            return int(candidate), str(described or value)
-    return None
+            links.append((int(candidate), str(described) if described else None))
+    return links
+
+
+def _first_indexed_device(
+    index: object, value: str, *, exact: bool = False
+) -> tuple[int, str] | None:
+    """Pick ``(did, name)`` from a REST ``device`` index, preferring an exact name match.
+
+    ``filter.name.contains`` returns ``edge-01`` and ``edge-01-old`` alike for ``edge-01``, in an
+    order SL1 does not promise, so the first link is not necessarily the device the caller named.
+    The preference is an exact match, then a case-insensitive one (MariaDB's default collation,
+    which the SQL name lookup this replaced compared under, ignores case), then, unless ``exact``,
+    the first link. A link with no description never counts as an exact match: its name would only
+    be the search text echoed back.
+
+    Only the links SL1 returned are considered, so with ``exact`` a name that more than five
+    devices contain may miss its exact match; the refusal says to pass the id instead.
+
+    :param index: The decoded ``GET device`` response.
+    :param value: The stripped search text, used as the name when a link has no description.
+    :param exact: Return ``None`` rather than a link whose name only contains ``value``.
+    :return: ``(did, name)``, or ``None`` when no link qualifies.
+    """
+    links = _indexed_devices(index)
+    for did, described in links:
+        if described is not None and described == value:
+            return did, described
+    folded = value.casefold()
+    for did, described in links:
+        if described is not None and described.casefold() == folded:
+            return did, described
+    if exact or not links:
+        return None
+    did, described = links[0]
+    return did, described or value
 
 
 def one_value(rows: tuple[Row, ...]) -> object | None:
