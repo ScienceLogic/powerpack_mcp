@@ -246,6 +246,7 @@ call, not as a probe (`operations.md` §1).
 | `401 Unauthorized` | Wrong credentials — or a newline in the base64 from using `echo` instead of `printf` |
 | `401` with correct credentials | nginx may not be forwarding `Authorization` — see §1 |
 | `credential_missing` | Request carried no usable credential; the header never arrived |
+| `request_deadline_exceeded` (HTTP 504) | The request hit the server's time limit before it replied. Retry a read, ideally narrower; check whether a write took effect before retrying it |
 | `404` on `/mcp` | nginx fragment missing or clobbered by a platform upgrade — `operations.md` §5 |
 | `lce_unreachable` on every tool call | Server-side, not client-side: usually `LCE_VERIFY_TLS` — `operations.md` §2 |
 | Works in one project, absent in another | Registered at `local` scope instead of `--scope user` |

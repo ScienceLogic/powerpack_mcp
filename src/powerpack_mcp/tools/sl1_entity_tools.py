@@ -792,7 +792,9 @@ def make_sl1_replace_universal_credential(context: Sl1ToolContext) -> Sl1ToolFac
 # ---- Credential readers: sl1_list_credentials and sl1_get_credential ----------------------------
 #
 # This is the security core of the module. Read ``_filter_definition`` before editing either tool.
-# Neither tool may return a secret.
+# Neither tool may return a secret. Nor may the passthroughs: ``sl1_credential_guard`` refuses their
+# credential reads and routes any credential node found in their responses through
+# ``_safe_credential``, so this section is the one place for both.
 #
 # Why withholding is post-processing: ``Credential.definition`` is a ``JSON`` scalar carrying
 # stringified JSON, so it arrives as a ``str``. GraphQL sub-selection works on object types only,
@@ -971,14 +973,66 @@ _AWS_UNIVERSAL_SAFE: Final[frozenset[str]] = frozenset(
     }
 )
 
+# The remaining subtypes below were measured from the ``credentialFields`` templates
+# (``master.credential_fields``) on two appliances. Each set is complete for its template, because
+# a subtype entry replaces the type-level set rather than extending it.
+#
+# The Low-code REST-shaped subtypes share the REST v104 fields, so they start from that set. The
+# same deliberate withholdings apply to them (``authHeader``, ``tokenKey``, the header fields,
+# ``opts``, ``authOverride``). ``Prometheus v100`` does not flag its ``apikey`` ``encryption: true``
+# while REST v104 does, a second case of the flag being unreliable; it is withheld regardless.
+_UNIVERSAL_REST_SAFE: Final[frozenset[str]] = _DEFINITION_ALLOWLIST["UNIVERSAL"]
+
+# ``cred_pwd`` and ``ssh_key_data`` (the private key) are withheld; the ``ps_*`` fields are the
+# PowerShell transport settings, not secrets.
+_UNIVERSAL_SSH_SAFE: Final[frozenset[str]] = frozenset(
+    {
+        "cred_host",
+        "cred_port",
+        "cred_user",
+        "record_metrics",
+        "use_powershell",
+        "ps_account_type",
+        "ps_ad_domain",
+        "ps_ad_host",
+        "ps_msg_encryption",
+        "ps_proxy_host",
+        "ps_encrypted",
+        "ps_cert_validate",
+    }
+)
+
+# ``AccessKeyId`` is withheld with ``SecretAccessKey`` on the ``AwsAccessKeyId`` rule, and the
+# backup encryption password and salt are secret.
+_S3_BACKUP_SAFE: Final[frozenset[str]] = frozenset({"Provider", "Endpoint", "Region", "Bucket"})
+
+# The SOAP_XML subtypes have their own field names, so the type-level SOAP_XML set would withhold
+# nearly all of them. Key ids (``awsAccessKeyId``, Aliyun's ``accessKey``) are withheld on the
+# ``AwsAccessKeyId`` rule. Azure's application, tenant and subscription ids are identifiers, not
+# credentials, so they are returned; only ``azureSecretKey`` is the secret.
+_SOAP_PROXY_SAFE: Final[frozenset[str]] = frozenset({"proxyHost", "proxyPort", "proxyUser"})
+
 # Only subtypes whose templates were actually read are listed. An unlisted subtype falls back to
-# ``_DEFINITION_ALLOWLIST``, which is correct for the ``SOAP_XML`` and ``BASIC_SNIPPET`` subtypes
-# (their fields match the type-level template) and still withholds everything for the remaining
-# ``UNIVERSAL`` subtypes. Adding one is a data change plus a measurement.
+# ``_DEFINITION_ALLOWLIST``, which is correct for the ``BASIC_SNIPPET`` subtypes ``citrixXen`` and
+# ``ibm`` (their fields match the type-level template) and withholds everything for ``SL Service
+# Connection``, whose only field is ``secret``. Adding one is a data change plus a measurement.
 _SUBTYPE_DEFINITION_ALLOWLIST: Final[Mapping[tuple[str, str], frozenset[str]]] = {
     ("UNIVERSAL", "aws assume role"): _AWS_UNIVERSAL_SAFE,
     ("UNIVERSAL", "aws ec2"): _AWS_UNIVERSAL_SAFE,
     ("UNIVERSAL", "aws iam"): _AWS_UNIVERSAL_SAFE,
+    ("UNIVERSAL", "Low-code Tools: REST v105"): _UNIVERSAL_REST_SAFE | {"record_metrics"},
+    ("UNIVERSAL", "Low-code Tools: Prometheus v100"): (
+        _UNIVERSAL_REST_SAFE | {"tokenauth_refresh", "tokenauth_refresh_static_ttl"}
+    ),
+    ("UNIVERSAL", "HPE: Aruba Networking Central"): _UNIVERSAL_REST_SAFE,
+    ("UNIVERSAL", "Low-code Tools: SSH v105"): _UNIVERSAL_SSH_SAFE,
+    ("UNIVERSAL", "VMware vSphere"): frozenset({"username", "url"}),
+    ("UNIVERSAL", "S3Backup"): _S3_BACKUP_SAFE,
+    ("SOAP_XML", "VMware vSphere SOAP"): frozenset({"vmwareWebServiceUsername", "url"}),
+    ("SOAP_XML", "aws"): _SOAP_PROXY_SAFE | {"awsEndpoint"},
+    ("SOAP_XML", "azure"): _SOAP_PROXY_SAFE
+    | {"azureUrl", "azureApplicationId", "azureTenantId", "azureSubscriptionId"},
+    ("SOAP_XML", "aliyun"): _SOAP_PROXY_SAFE,
 }
 
 # The non-``definition`` fields either reader returns: a second fence, deliberately narrower than

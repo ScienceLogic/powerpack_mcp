@@ -16,6 +16,14 @@ queryVariables, result}``. Each variable is a reference in one of these forms:
 - ``{"field": "credential"}``: the session's credential, with no prefix (see
   ``_credential_from_definition``).
 
+Both the caller-facing result and every workflow-authored action document pass through
+``sl1_credential_guard``. A workflow is platform data that a caller with ``sl1_graphql`` can author,
+so every action's document is checked exactly as ``sl1_graphql`` would check it, all of them before
+``createGuidedDiscoverySession`` is sent (and in a dry run), so a refused workflow creates nothing.
+Each action is checked again with its resolved variables just before it runs. A session
+``definition`` that embeds credential objects (the UI writes them; see
+``_credential_from_definition``) is scrubbed on the way out.
+
 ``dateRun`` is not a run indicator: a session that has run still reports ``null``, the UI does not
 stamp it, and neither does this tool.
 """
@@ -27,6 +35,10 @@ from typing import TYPE_CHECKING, Any, Final
 
 from powerpack_mcp.errors import PowerPackMcpError
 from powerpack_mcp.tools import sl1_descriptors as d
+from powerpack_mcp.tools.sl1_credential_guard import (
+    refuse_credential_secret_document,
+    scrub_credential_secrets,
+)
 from powerpack_mcp.tools.sl1_pipeline import audit_passthrough, sl1_tool_boundary
 
 if TYPE_CHECKING:
@@ -428,7 +440,7 @@ mutation CreateGuidedDiscoverySession(
   createGuidedDiscoverySession(
     name: $name, discoveryWorkflow: $discoveryWorkflow, organization: $organization,
     definition: $definition, description: $description
-  ) { id name dateRun definition organization { id } discoveryWorkflow { id name definition } }
+  ) { id name dateRun definition organization { id } }
 }
 """
 
@@ -523,7 +535,9 @@ def make_sl1_create_guided_discovery_session(context: Sl1ToolContext) -> Sl1Tool
         returns the ordered plan without creating the session or running anything.
 
         The actions are named by the workflow definition, which is platform data -- so this tool
-        issues whatever mutations that definition lists. Review a dry run before committing.
+        issues whatever mutations that definition lists. Review a dry run before committing. A
+        workflow with an action that would read credential or other secrets is refused before
+        anything is created, as sl1_graphql would refuse that action.
 
         Args:
             name: Session name.
@@ -549,8 +563,18 @@ def make_sl1_create_guided_discovery_session(context: Sl1ToolContext) -> Sl1Tool
             d.CREATE_GUIDED_DISCOVERY_SESSION, method="POST", path="/gql", outcome="invoked"
         )
 
+        # The workflow is read, and every action document checked, before anything is created: a
+        # refusal half way through would leave a session behind.
+        workflow = await _read_workflow(context, discovery_workflow)
+        actions = discovery_actions_of(workflow.get("definition"))
+        _refuse_unsafe_actions(actions)
+
+        # Both returns are scrubbed: a session definition can embed full credential objects, and
+        # the plan echoes the caller's definition back.
         if dry_run:
-            return await _dry_run(context, discovery_workflow, organization, definition)
+            return scrub_credential_secrets(
+                _dry_run(workflow, discovery_workflow, organization, definition)
+            )
 
         created = await _issue(
             context,
@@ -565,14 +589,11 @@ def make_sl1_create_guided_discovery_session(context: Sl1ToolContext) -> Sl1Tool
             "createGuidedDiscoverySession",
         )
         session = created if isinstance(created, dict) else {}
-        workflow = session.get("discoveryWorkflow") or await _read_workflow(
-            context, discovery_workflow
-        )
-
-        actions = discovery_actions_of(workflow.get("definition"))
+        # The workflow read and checked above is the one that runs, not a second copy from the
+        # create response that the check never saw.
         executed = await _execute_actions(context, session, workflow, actions)
 
-        return {
+        ran = {
             "session": {k: v for k, v in session.items() if k != "discoveryWorkflow"},
             "executed": executed,
             "note": (
@@ -581,12 +602,26 @@ def make_sl1_create_guided_discovery_session(context: Sl1ToolContext) -> Sl1Tool
                 "reads null, so the field is not a run indicator."
             ),
         }
+        return scrub_credential_secrets(ran)
 
     return sl1_create_guided_discovery_session
 
 
-async def _dry_run(
-    context: Sl1ToolContext,
+def _refuse_unsafe_actions(actions: list[dict[str, Any]]) -> None:
+    """Check every action's document with the GraphQL rule, before anything is sent.
+
+    Variables are not known yet (later ones come from earlier actions' outputs), so this is the
+    document check alone; ``_execute_actions`` checks each action again with its variables.
+
+    :raises ValidationBlocked: If any action's document is refused.
+    :raises ResolutionError: If an action cannot be rendered as a document.
+    """
+    for action in actions:
+        refuse_credential_secret_document(build_mutation_document(action), argument="definition")
+
+
+def _dry_run(
+    workflow: dict[str, Any],
     discovery_workflow: str,
     organization: str,
     definition: dict[str, Any],
@@ -594,13 +629,19 @@ async def _dry_run(
     """Resolve the plan for a session that is described, not created, and return it for review."""
     # The resolver only needs the session's shape, and the value of a dry run is that nothing
     # exists afterwards.
-    workflow = await _read_workflow(context, discovery_workflow)
     pretend = {
         "id": "<not created -- dry run>",
         "organization": {"id": organization},
         "definition": definition,
     }
     plan, _ = _plan_all(pretend, workflow, dry_run=True)
+    # The variable half of the check, as far as the plan resolves: what an execution would send,
+    # placeholders included, so a dry run refuses what the real run would.
+    actions = discovery_actions_of(workflow.get("definition"))
+    for action, planned in zip(actions, plan, strict=False):
+        refuse_credential_secret_document(
+            build_mutation_document(action), planned.variables, argument="definition"
+        )
     return {
         "dry_run": True,
         "workflow": {"id": discovery_workflow, "name": workflow.get("name")},
@@ -633,6 +674,9 @@ async def _execute_actions(
         for index in range(len(executed), len(plan)):
             action, planned = actions[index], plan[index]
             document = build_mutation_document(action)
+            # The document is the workflow's, not ours, so it gets the same check a caller's
+            # document gets from ``sl1_graphql``, now with the variables it will be sent with.
+            refuse_credential_secret_document(document, planned.variables, argument="definition")
             result = await _issue(context, document, planned.variables, planned.mutation)
             # ``outputs`` keeps the unbounded result. Later actions resolve
             # ``mutation.<name>.<field>`` out of this dict, so a truncated value here would be sent
@@ -642,7 +686,9 @@ async def _execute_actions(
                 {
                     "mutation": planned.mutation,
                     "variables": planned.variables,
-                    "result": _bounded_result(result),
+                    # Scrubbed before it is bounded: a JSON string cut at the bound no longer
+                    # parses, and the scrub could not reach the secrets inside it.
+                    "result": _bounded_result(scrub_credential_secrets(result)),
                 }
             )
     return executed

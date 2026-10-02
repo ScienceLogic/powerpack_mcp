@@ -12,9 +12,11 @@ run needs no appliance, no credential and no network. The substitutable transpor
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 from hypothesis import given, settings
@@ -32,6 +34,7 @@ from powerpack_mcp.errors import (
     Sl1Unreachable,
     ValidationBlocked,
 )
+from powerpack_mcp.mcp_app.concurrency import OUTBOUND_DEADLINE_MARGIN_SECONDS, REQUEST_DEADLINE
 from powerpack_mcp.sl1_client import (
     GRAPHQL_PATH,
     SL1_API_BASE_PATH,
@@ -576,3 +579,88 @@ class TestTheStatusMessageIsTreatedAsForeignContent:
         result = await client.request(credential=_cred(), method="DELETE", path="event/1")
         assert isinstance(result, dict)
         assert result["message"] == ""
+
+
+# ---- the request deadline ------------------------------------------------------------------------
+
+
+def _hanging_client(config: Config) -> tuple[Sl1Client, list[httpx.Request]]:
+    """A client whose transport accepts every request and never answers it."""
+    seen: list[httpx.Request] = []
+
+    async def never(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        await anyio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    client = Sl1Client(config)
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(never))
+    return client, seen
+
+
+class TestRequestDeadline:
+    """The whole exchange ends ``OUTBOUND_DEADLINE_MARGIN_SECONDS`` before the request deadline.
+
+    The httpx timeouts equal the gate's deadline, so without this the gate cancels the request a
+    few milliseconds before the client would raise, and a streamed reply never arrives.
+    """
+
+    _BUDGET = 0.3
+
+    async def _call(self, client: Sl1Client, accessor: str) -> object:
+        if accessor == "request":
+            return await client.request(credential=_cred(), method="GET", path="device")
+        return await client.graphql(credential=_cred(), query="{ x }")
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("accessor", ["request", "graphql"])
+    async def test_a_hanging_sl1_raises_unreachable_at_the_budget(
+        self, config: Config, accessor: str
+    ) -> None:
+        client, seen = _hanging_client(config)
+        token = REQUEST_DEADLINE.set(
+            time.monotonic() + OUTBOUND_DEADLINE_MARGIN_SECONDS + self._BUDGET
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(Sl1Unreachable) as exc:
+                await self._call(client, accessor)
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        elapsed = time.monotonic() - started
+        assert len(seen) == 1
+        assert isinstance(exc.value.__cause__, TimeoutError)
+        # Not the 30 s httpx read timeout, and not the gate's deadline either.
+        assert self._BUDGET - 0.05 <= elapsed < self._BUDGET + OUTBOUND_DEADLINE_MARGIN_SECONDS / 2
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("accessor", ["request", "graphql"])
+    @pytest.mark.parametrize("offset", [OUTBOUND_DEADLINE_MARGIN_SECONDS / 2, -1.0])
+    async def test_a_spent_budget_sends_nothing(
+        self, config: Config, accessor: str, offset: float
+    ) -> None:
+        client, seen = _hanging_client(config)
+        token = REQUEST_DEADLINE.set(time.monotonic() + offset)
+        try:
+            with pytest.raises(Sl1Unreachable):
+                await self._call(client, accessor)
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        assert seen == [], "a request that cannot finish before the gate must not be sent"
+
+    @pytest.mark.anyio
+    async def test_without_a_deadline_a_slow_response_still_completes(self, config: Config) -> None:
+        """Outside a gated request (no deadline in force) nothing new bounds the call."""
+
+        async def slow(_request: httpx.Request) -> httpx.Response:
+            await anyio.sleep(0.2)
+            return httpx.Response(200, json={"ok": True})
+
+        client = Sl1Client(config)
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+        token = REQUEST_DEADLINE.set(None)
+        try:
+            body = await client.request(credential=_cred(), method="GET", path="device")
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        assert body == {"ok": True}

@@ -48,7 +48,7 @@ from powerpack_mcp.errors import (
     DbUnreachable,
     LogEvent,
 )
-from powerpack_mcp.mcp_app.concurrency import remaining_deadline_seconds
+from powerpack_mcp.mcp_app.concurrency import outbound_budget_seconds
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -81,7 +81,7 @@ CONNECTION_CACHE_CEILING: Final[int] = 30
 
 # Floor for the statement timeout. MariaDB reads ``max_statement_time = 0`` as no limit, so a zero
 # value would turn an expired deadline into an unbounded query. Guarded here as well as in
-# ``remaining_deadline_seconds`` because this is the last point before the value reaches the server.
+# ``outbound_budget_seconds`` because this is the last point before the value reaches the server.
 MIN_STATEMENT_TIME_SECONDS: Final[float] = 0.001
 
 
@@ -254,12 +254,17 @@ class DbClient:
         if self._closed:
             raise DbUnreachable("db_client is closed")
 
-        # Capture the remainder here, on the event loop, and pass it in as an argument. The submit
+        # Capture the budget here, on the event loop, and pass it in as an argument. The submit
         # below also copies the context, but the statement bound is a correctness property, so it
         # comes from an argument that a future change to how work is submitted cannot silently
         # drop. A worker that saw ``None`` would run the query unbounded until the platform's
         # 3600 s default.
-        remaining = remaining_deadline_seconds()
+        #
+        # The budget, not the raw remainder: it ends ``OUTBOUND_DEADLINE_MARGIN_SECONDS`` before
+        # the request deadline. With the full remainder, MariaDB's errno 1969 and the concurrency
+        # gate's cancellation land at the same instant, the gate wins, and the caller gets no
+        # reply instead of a ``db_query_timeout``. ``mcp_app.concurrency`` explains the margin.
+        remaining = outbound_budget_seconds()
         self._refuse_if_deadline_spent(remaining)
         loop = asyncio.get_running_loop()
         try:
@@ -324,9 +329,9 @@ class DbClient:
         if self._closed:
             raise DbUnreachable("db_client is closed")
 
-        # As in ``fetch_all``: read the remainder on the event loop, and refuse a spent deadline
+        # As in ``fetch_all``: read the budget on the event loop, and refuse a spent deadline
         # before a connection or worker is occupied.
-        remaining = remaining_deadline_seconds()
+        remaining = outbound_budget_seconds()
         self._refuse_if_deadline_spent(remaining)
         loop = asyncio.get_running_loop()
         try:
@@ -361,8 +366,8 @@ class DbClient:
         results: list[StatementResult] = []
         for sql, params in prepared:
             # The bound is applied per statement using the deadline captured once before dispatch,
-            # so each statement gets the caller's full remainder and a unit of N statements can run
-            # up to N times that remainder on the server. The caller's await is still bounded by its
+            # so each statement gets the caller's full budget and a unit of N statements can run
+            # up to N times that budget on the server. The caller's await is still bounded by its
             # own ``asyncio`` deadline; those are different bounds.
             self._run_one(platform, cursor, sql, params, timeout)
             results.append(
@@ -473,11 +478,14 @@ class DbClient:
     def _refuse_if_deadline_spent(remaining: float | None) -> None:
         """Refuse before a worker or connection is occupied when the deadline is already spent.
 
-        ``remaining_deadline_seconds`` clamps at ``0.0``, so exactly zero means the deadline has
-        passed. Without this check, ``_statement_timeout`` would floor it to
-        ``MIN_STATEMENT_TIME_SECONDS`` and issue the statement with a 1 ms budget, MariaDB would
-        kill it with errno 1969, and the caller would get a ``DbQueryTimeout`` advising a narrower
-        query when nothing was slow.
+        ``remaining`` is ``outbound_budget_seconds()``, which clamps at ``0.0``, so exactly zero
+        means the deadline is within ``OUTBOUND_DEADLINE_MARGIN_SECONDS`` of passing: a statement
+        issued now could not report back before the gate cancels the request. The logged
+        ``remaining_deadline_seconds`` field carries that budget.
+
+        Without this check, ``_statement_timeout`` would floor it to ``MIN_STATEMENT_TIME_SECONDS``
+        and issue the statement with a 1 ms budget, MariaDB would kill it with errno 1969, and the
+        caller would get a ``DbQueryTimeout`` advising a narrower query when nothing was slow.
 
         The test is ``> 0.0``, with no invented threshold: a positive but tiny remainder still goes
         to the floor, because a minimum "worth attempting" budget would be policy this layer has no

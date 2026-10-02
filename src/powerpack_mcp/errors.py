@@ -23,9 +23,11 @@ __all__ = [
     "ERROR_TYPE_CONCURRENCY_LIMITED",
     "ERROR_TYPE_CREDENTIAL_MISSING",
     "ERROR_TYPE_INTERNAL",
+    "ERROR_TYPE_REQUEST_DEADLINE_EXCEEDED",
     "MAX_LCE_BODY_CHARS",
     "MAX_LCE_BODY_DEPTH",
     "REDACTED",
+    "REQUEST_DEADLINE_EXCEEDED_PAYLOAD",
     "SECRET_FIELD_DENYLIST",
     "AuthorizationDenied",
     "CollectionJobNotOwned",
@@ -214,6 +216,12 @@ ErrorType = Literal[
     # Returned with HTTP 503 by the concurrency gate. ``internal_error`` would tell the caller to
     # report a bug, when the right advice for this transient condition is to retry shortly.
     "concurrency_limited",
+    # Returned with HTTP 504 by the concurrency gate when a request reaches the inbound deadline
+    # before its response has started. Shares its name with the ``LogEvent`` the gate emits. Not
+    # ``internal_error``, whose advice is to report a bug: the right advice is to retry, perhaps
+    # with a narrower query. Unlike ``concurrency_limited`` the work may have begun, so the message
+    # tells a caller to check a write before repeating it.
+    "request_deadline_exceeded",
     # Separate from ``validation_blocked`` because "you did not authenticate" and "your payload is
     # invalid" call for different client behaviour.
     "credential_missing",
@@ -267,6 +275,7 @@ SL1_RESTRICTED_ACCESS_CODE: Final[str] = "RESTRICTED_ACCESS"
 
 ERROR_TYPE_INTERNAL: Final[ErrorType] = "internal_error"
 ERROR_TYPE_CONCURRENCY_LIMITED: Final[ErrorType] = "concurrency_limited"
+ERROR_TYPE_REQUEST_DEADLINE_EXCEEDED: Final[ErrorType] = "request_deadline_exceeded"
 ERROR_TYPE_CREDENTIAL_MISSING: Final[ErrorType] = "credential_missing"
 ERROR_TYPE_AUTHORIZATION_DENIED: Final[ErrorType] = "authorization_denied"
 
@@ -279,6 +288,19 @@ CONCURRENCY_LIMITED_PAYLOAD: Final[dict[str, dict[str, object]]] = {
         "message": (
             "The service is handling its maximum number of concurrent requests. This is transient "
             "and clears on its own -- retry shortly."
+        ),
+    }
+}
+
+# The gate's payload for a request that reached the inbound deadline before it began responding.
+# Like the one above, returned inline by the middleware rather than raised.
+REQUEST_DEADLINE_EXCEEDED_PAYLOAD: Final[dict[str, dict[str, object]]] = {
+    "error": {
+        "type": ERROR_TYPE_REQUEST_DEADLINE_EXCEEDED,
+        "message": (
+            "The request exceeded the service's time limit and was stopped, possibly after some "
+            "of its work was done. A read can be retried, ideally with a narrower query; check "
+            "whether a write took effect before you retry it."
         ),
     }
 }
@@ -919,8 +941,8 @@ def build_error_payload(exc: PowerPackMcpError) -> dict[str, dict[str, object]]:
             error = {
                 "type": "validation_blocked",
                 "message": (
-                    "The request was rejected before it reached LCE. Correct every path listed in "
-                    "details and resubmit."
+                    "The request was rejected before it reached Skylar One. Correct every path "
+                    "listed in details and resubmit."
                 ),
                 # Every finding, one entry per offending path.
                 "details": [

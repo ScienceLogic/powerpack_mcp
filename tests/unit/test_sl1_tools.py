@@ -1603,7 +1603,14 @@ class TestGraphQlEnvelopeProperty:
 
     @settings(max_examples=75, deadline=None)
     @given(
-        query=st.text(min_size=1, max_size=60),
+        # Mostly valid documents, so the round trip is actually exercised; arbitrary text is mixed
+        # in so the other branch -- refused, and nothing sent -- is too.
+        query=st.one_of(
+            st.from_regex(r"[A-Za-z_][A-Za-z0-9_]{0,20}", fullmatch=True).map(
+                lambda name: f"{{ {name} }}"
+            ),
+            st.text(min_size=1, max_size=60),
+        ),
         variables=st.dictionaries(
             st.text(min_size=1, max_size=8),
             st.one_of(st.integers(), st.booleans(), st.text(max_size=8)),
@@ -1623,17 +1630,27 @@ class TestGraphQlEnvelopeProperty:
         passthrough must send it as-is. Optional members are absent when not supplied rather than
         null, because some servers reject a single-operation document with
         ``operationName: null``.
+
+        The one exception is a document the credential guard refuses, which must not be sent at
+        all: either the request carries exactly what was supplied, or there is no request.
         """
         import anyio
         from pydantic import SecretStr
+
+        from powerpack_mcp.tools.sl1_credential_guard import graphql_document_refusal
 
         async def exercise() -> None:
             config = Config()
             credential = LceCredential(SecretStr("Basic dXNlcjpwYXNz"))
             context, seen, _ = _ctx(config, credential, _gql_ok({"ok": 1}))
-            await gql.make_sl1_graphql(context)(
+            result = await gql.make_sl1_graphql(context)(
                 query=query, variables=variables, operation_name=operation_name
             )
+            if graphql_document_refusal(query, variables) is not None:
+                assert seen == [], "a refused document reached SL1"
+                assert isinstance(result, dict)
+                assert result["error"]["type"] == "validation_blocked"
+                return
             envelope = json.loads(seen[0].content)
             assert envelope["query"] == query
             if variables:

@@ -540,13 +540,13 @@ class TestTheToolExecutes:
             "definition": json.dumps(
                 {"rootDevice": "r", "selectedCollectorGroupId": "1", "credential": "GUID"}
             ),
-            "discoveryWorkflow": _WORKFLOW_ROW,
         }
         context, seen, _ = _ctx(
             config,
             credential,
             _gql(
                 [
+                    {"guidedDiscoveryWorkflow": _WORKFLOW_ROW},
                     {"createGuidedDiscoverySession": session_row},
                     {"createVirtualDevice": {"id": "13", "name": "r"}},
                     {"alignDynamicApplicationsToDevice": {"id": "DA"}},
@@ -566,7 +566,10 @@ class TestTheToolExecutes:
             "alignDynamicApplicationsToDevice",
         ]
         assert executed[1]["variables"]["device"] == "13", "step one's id must reach step two"
-        assert len(seen) == 3, "one create plus one call per action"
+        assert len(seen) == 4, "the workflow read, one create, then one call per action"
+        first = json.loads(seen[0].content)["query"]
+        assert "guidedDiscoveryWorkflow" in first, "the workflow is read and checked first"
+        assert "createGuidedDiscoverySession" in json.loads(seen[1].content)["query"]
         assert "discoveryWorkflow" not in result["session"], (
             "the workflow definition is bulky platform data and is not echoed back"
         )
@@ -586,10 +589,14 @@ class TestTheToolExecutes:
             "id": "S",
             "organization": {"id": "1"},
             "definition": json.dumps({"rootDevice": "r"}),
-            "discoveryWorkflow": {"id": "w", "definition": json.dumps({"discoveryActions": []})},
         }
+        empty = {"id": "w", "definition": json.dumps({"discoveryActions": []})}
         context, seen, _ = _ctx(
-            config, credential, _gql([{"createGuidedDiscoverySession": session_row}])
+            config,
+            credential,
+            _gql(
+                [{"guidedDiscoveryWorkflow": empty}, {"createGuidedDiscoverySession": session_row}]
+            ),
         )
         result = await make_sl1_create_guided_discovery_session(context)(
             name="n", discovery_workflow="w", organization="1", definition={"rootDevice": "r"}
@@ -711,13 +718,13 @@ class TestTheResultBoundIsOnValuesNotNames:
             "definition": json.dumps(
                 {"rootDevice": "r", "selectedCollectorGroupId": "1", "credential": "GUID"}
             ),
-            "discoveryWorkflow": _WORKFLOW_ROW,
         }
         context, seen, _ = _ctx(
             config,
             credential,
             _gql(
                 [
+                    {"guidedDiscoveryWorkflow": _WORKFLOW_ROW},
                     {"createGuidedDiscoverySession": session_row},
                     {
                         "createVirtualDevice": {
@@ -749,6 +756,70 @@ class TestTheResultBoundIsOnValuesNotNames:
         assert result["executed"][1]["variables"]["device"] == long_id
         sent = json.loads(seen[-1].content)
         assert long_id in json.dumps(sent), "a truncated id must never reach the platform"
+
+    @pytest.mark.anyio
+    async def test_a_secret_in_a_result_longer_than_the_bound_is_scrubbed_before_it_is_cut(
+        self, config: Config, credential: LceCredential
+    ) -> None:
+        """Ported from review: the bound cut a JSON string the scrub then could not parse.
+
+        The session definition embeds a credential node and is longer than the bound. Bounded
+        first, it is no longer JSON and the scrub passed it through, secret and all; scrubbed
+        first, the secret is gone before anything is cut.
+        """
+        from tests.unit.test_credential_definition_filter import CANARY
+        from tests.unit.test_sl1_tools import _ctx
+
+        secret_definition = json.dumps(
+            {
+                "credentials": [
+                    {
+                        "__typename": "Credential",
+                        "id": "3",
+                        "guid": "G",
+                        "type": "SNMP",
+                        "definition": json.dumps({"snmpRoCommunity": CANARY, "snmpVersion": "2"}),
+                    }
+                ],
+                "pad": "x" * 2000,
+            }
+        )
+        assert len(secret_definition) > MAX_RESULT_STRING_CHARS
+        workflow = {
+            "id": "7",
+            "name": "w",
+            "definition": json.dumps(
+                {
+                    "discoveryActions": [
+                        {
+                            "mutationName": "updateGuidedDiscoverySession",
+                            "queryVariables": {
+                                "id": {"fieldType": "ID!", "fieldName": {"value": "1"}}
+                            },
+                            "result": [{"field": "id"}, {"field": "definition"}],
+                        }
+                    ]
+                }
+            ),
+        }
+        context, _, _ = _ctx(
+            config,
+            credential,
+            _gql(
+                [
+                    {"guidedDiscoveryWorkflow": workflow},
+                    {"createGuidedDiscoverySession": {"id": "1", "name": "s", "definition": "{}"}},
+                    {"updateGuidedDiscoverySession": {"id": "1", "definition": secret_definition}},
+                ]
+            ),
+        )
+        result = await make_sl1_create_guided_discovery_session(context)(
+            name="s", discovery_workflow="7", organization="0", definition={"x": "y"}
+        )
+        assert isinstance(result, dict)
+        assert "error" not in result, result
+        assert CANARY not in json.dumps(result)
+        assert result["executed"][0]["result"]["id"] == "1"
 
 
 class TestTheLastDefensiveBranches:

@@ -84,9 +84,9 @@ Tool selection (prefer the earliest that fits):
 7. Mutating with an LCE upsert? Pass `commit=False` first. That is LCE's own dry run: nothing is
    written, and you get to review the result before the real call.
 8. Credentials: read before you write, and know which write actually works. `sl1_list_credentials`
-   then `sl1_get_credential` to find and inspect one -- secret values are withheld unless your
-   account holds the password-viewing hook, so a redacted definition means your entitlement, not a
-   missing field. ⛔ `sl1_update_universal_credential` DOES NOT WORK on SL1 12.5.21: its merge
+   then `sl1_get_credential` to find and inspect one -- secret values are always withheld and the
+   withheld keys are named, so a redacted definition is expected, not a missing field.
+   ⛔ `sl1_update_universal_credential` DOES NOT WORK on SL1 12.5.21: its merge
    resolver throws and the credential is left byte-for-byte unchanged, so a "failed" update has
    changed nothing. `sl1_replace_universal_credential` is the working path -- but it is
    DESTRUCTIVE, deleting and recreating, so fetch the current definition with
@@ -220,7 +220,10 @@ Device classes and component trees (five tools, and three of them cannot be undo
    numeric class type; `sl1_get_component_tree` takes a device id or name.
 7. `sl1_get_component_tree` and `sl1_get_device_class_alignment` only read. Both can truncate, and
    both say so -- check the truncation and limit fields they return, because a truncated answer is
-   otherwise indistinguishable from a complete one."""
+   otherwise indistinguishable from a complete one.
+8. `sl1_get_component_tree` names its root exactly, and a root your account cannot see fails with
+   SL1's 403 or 404. It lists only components in the root's organization, active or vanished;
+   any others are only counted in `withheld_components`."""
 
 _EVENT_VERIFICATION: Final[str] = """\
 Verifying event behaviour -- TWO tools that look interchangeable and are not:
@@ -253,7 +256,9 @@ UNIVERSAL credentials -- the `definition` field is where a session gets lost:
 1. ⛔ `definition` is a JSON-ENCODED STRING, not a nested object. It is an opaque scalar with no
    schema of its own, so nothing in the GraphQL types will tell you its shape.
 2. The field names come from the `credentialFields` query PER TYPE AND SUBTYPE. Query that for the
-   template before you construct anything -- the names are not discoverable any other way.
+   template before you construct anything -- the names are not discoverable any other way. Through
+   `sl1_graphql`, select `type subType typeDescription definition` on its nodes; a template's
+   `definition` is allowed, but a credential query may select only non-secret metadata.
 3. ⚠️ Subtype names are CASE- AND SPACE-EXACT. The UNIVERSAL AWS ones are `aws assume role`,
    `aws ec2` and `aws iam`, all lowercase. Naming any subtype other than the REST default also
    switches OFF the REST-specific defaulting, so you must then supply a complete definition.

@@ -964,7 +964,6 @@ class TestStatementBuilders:
         ``CLIENT_MULTI_STATEMENTS`` set on this platform the second would run.
         """
         statements = (
-            dbst.resolve_root_did_by_name(operand),
             dbst.resolve_powerpack_guid_by_name(operand),
             dbst.resolve_class_type_by_guid(operand),
             dbst.read_device_class_by_guid(operand),

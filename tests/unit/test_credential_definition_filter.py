@@ -36,6 +36,7 @@ from powerpack_mcp.errors import (
 )
 from powerpack_mcp.tools import sl1_descriptors as d
 from powerpack_mcp.tools import sl1_entity_tools as ent
+from powerpack_mcp.tools.sl1_credential_definition import CREDENTIAL_SECRET_KEYS
 from powerpack_mcp.tools.sl1_pipeline import Sl1ToolContext
 
 if TYPE_CHECKING:
@@ -59,47 +60,11 @@ CREDENTIAL_TYPES: frozenset[str] = frozenset(
 
 # Every definition key that carries secret material. None may ever be returned, under any type.
 #
-# The first twenty were observed on an appliance across all eight types. ``authHeader`` and
-# ``tokenKey`` were not observed; they are withheld because they were classified safe only from
-# SL1's defaults table, and ``authHeader`` can carry a literal ``Authorization`` value. Fail closed
-# on ambiguity.
-#
-# ``sshKeyData`` matters most. There is no field named ``pemkey`` in the schema, so a rule that
-# excluded "password or pemkey" would ship every SSH private key while looking deliberate.
-KNOWN_SECRET_KEYS: tuple[str, ...] = (
-    "password",
-    "apikey",
-    "snmpRoCommunity",
-    "snmpRwCommunity",
-    "snmpv3PrivPwd",
-    "proxyPasswd",
-    "requestPasswd",
-    "sshKeyData",
-    "oauth2ClientSecret",
-    "oauth2ResourceOwnerPassword",
-    "oauth2ResourceOwnerAdditionalParams",
-    "httpHeaders",
-    "httpHeader1",
-    "httpHeader2",
-    "curlOptions",
-    "requestSub1",
-    "requestSub2",
-    "requestSub3",
-    "requestSub4",
-    "authOverride",
-    "opts",
-    "authHeader",
-    "tokenKey",
-    # Measured from the AWS ``credentialFields`` templates. These are not redundant case variants:
-    # matching is exact, so ``ProxyPasswd`` and ``proxyPasswd`` are different keys and both must be
-    # listed. That is why the AWS subtypes needed their own measurement.
-    "AwsSecretAccessKey",
-    "ProxyPasswd",
-    # The platform does not flag ``AwsAccessKeyId`` with ``encryption: true``. It is withheld as
-    # one half of a key pair, on the same fail-closed rule as ``authHeader``. See the header of
-    # ``_SUBTYPE_DEFINITION_ALLOWLIST``.
-    "AwsAccessKeyId",
-)
+# Imported rather than restated: ``CREDENTIAL_SECRET_KEYS`` is the one list, shared with the
+# passthroughs' response scrub and GraphQL guard, and its header carries the provenance of each
+# name. These tests do not trust it blindly -- the typed readers are tested by allowlist, so a name
+# missing from it is still withheld, and ``TestNonVacuity`` pins the entries that matter most.
+KNOWN_SECRET_KEYS: tuple[str, ...] = CREDENTIAL_SECRET_KEYS
 
 # The ten secret keys actually observed on the appliance, for the denylist measurement below.
 OBSERVED_SECRET_KEYS: tuple[str, ...] = (
@@ -421,6 +386,287 @@ class TestTheAwsSubtypesAreClassifiedFromTheMeasuredTemplates:
         assert withheld == ["AwsEndpoint", "Regions"]
         assert reason is not None
         assert "QUANTUM_SNIPPET" in reason
+
+
+class TestTheOtherSubtypesAreClassifiedFromTheMeasuredTemplates:
+    """Every other subtype with a template on the test appliances, checked as the AWS ones are.
+
+    ``MEASURED_TEMPLATES`` is each template's ``definition.fields`` from
+    ``master.credential_fields`` on two appliances: each propName and whether the platform set
+    ``encryption: true``. Layout dividers are left out. ``EXPECTED_WITHHELD`` is the decision per
+    subtype, written out rather than derived, so a change to the allowlist has to change it too.
+    """
+
+    MEASURED_TEMPLATES: ClassVar[dict[tuple[str, str], dict[str, bool]]] = {
+        ("UNIVERSAL", "Low-code Tools: REST v105"): {
+            "authType": False,
+            "url": False,
+            "authEndpoint": False,
+            "authHeader": False,
+            "tokenKey": False,
+            "tokenFormat": False,
+            "username": False,
+            "password": True,
+            "proxy": False,
+            "proxy_scheme": False,
+            "proxyHost": False,
+            "proxyPort": False,
+            "proxyUser": False,
+            "proxyPasswd": True,
+            "httpHeader1": False,
+            "httpHeader2": False,
+            "httpHeaders": False,
+            "sslverifypeer": False,
+            "ca_path": False,
+            "timeToNextRequest": False,
+            "opts": False,
+            "debug": False,
+            "record_metrics": False,
+            "tokenAuthRefresh": False,
+            "tokenRefreshTTL": False,
+            "tokenExpiresInSelector": False,
+            "oauth2ClientId": False,
+            "oauth2ClientSecret": True,
+            "oauth2TokenURL": False,
+            "oauth2TokenLabel": False,
+            "oauth2TokenFormat": False,
+            "oauth2TokenKey": False,
+            "oauth2Type": False,
+            "oauth2AuthType": False,
+            "oauth2ClientCredentialsScope": False,
+            "oauth2ResourceOwnerUsername": False,
+            "oauth2ResourceOwnerPassword": True,
+            "oauth2ResourceOwnerScope": False,
+            "oauth2ResourceOwnerAdditionalParams": False,
+            "prefix": False,
+            "suffix": False,
+            "apikey": True,
+            "authOverride": False,
+        },
+        ("UNIVERSAL", "Low-code Tools: Prometheus v100"): {
+            "authType": False,
+            "url": False,
+            "authEndpoint": False,
+            "authHeader": False,
+            "tokenKey": False,
+            "tokenFormat": False,
+            "username": False,
+            "password": True,
+            "proxy": False,
+            "proxyHost": False,
+            "proxyPort": False,
+            "proxyUser": False,
+            "proxyPasswd": True,
+            "httpHeader1": False,
+            "httpHeader2": False,
+            "httpHeaders": False,
+            "sslverifypeer": False,
+            "timeToNextRequest": False,
+            "opts": False,
+            "debug": False,
+            "tokenauth_refresh": False,
+            "tokenauth_refresh_static_ttl": False,
+            "oauth2ClientId": False,
+            "oauth2ClientSecret": True,
+            "oauth2TokenURL": False,
+            "oauth2TokenLabel": False,
+            "oauth2TokenFormat": False,
+            "oauth2TokenKey": False,
+            "oauth2Type": False,
+            "oauth2AuthType": False,
+            "oauth2ClientCredentialsScope": False,
+            "oauth2ResourceOwnerUsername": False,
+            "oauth2ResourceOwnerPassword": True,
+            "oauth2ResourceOwnerScope": False,
+            "oauth2ResourceOwnerAdditionalParams": False,
+            "prefix": False,
+            "suffix": False,
+            "apikey": False,
+        },
+        ("UNIVERSAL", "HPE: Aruba Networking Central"): {
+            "authType": False,
+            "url": False,
+            "proxy": False,
+            "proxy_scheme": False,
+            "proxyHost": False,
+            "proxyPort": False,
+            "proxyUser": False,
+            "proxyPasswd": True,
+            "httpHeaders": False,
+            "sslverifypeer": False,
+            "ca_path": False,
+            "timeToNextRequest": False,
+            "debug": False,
+            "tokenAuthRefresh": False,
+            "tokenRefreshTTL": False,
+            "tokenExpiresInSelector": False,
+            "oauth2ClientId": False,
+            "oauth2ClientSecret": True,
+            "oauth2TokenURL": False,
+            "oauth2TokenLabel": False,
+            "oauth2TokenFormat": False,
+            "oauth2TokenKey": False,
+            "oauth2Type": False,
+            "oauth2AuthType": False,
+            "oauth2ClientCredentialsScope": False,
+            "oauth2ResourceOwnerUsername": False,
+            "oauth2ResourceOwnerPassword": True,
+            "oauth2ResourceOwnerScope": False,
+            "oauth2ResourceOwnerAdditionalParams": False,
+        },
+        ("UNIVERSAL", "Low-code Tools: SSH v105"): {
+            "cred_host": False,
+            "cred_port": False,
+            "cred_user": False,
+            "cred_pwd": True,
+            "ssh_key_data": True,
+            "record_metrics": False,
+            "use_powershell": False,
+            "ps_account_type": False,
+            "ps_ad_domain": False,
+            "ps_ad_host": False,
+            "ps_msg_encryption": False,
+            "ps_proxy_host": False,
+            "ps_encrypted": False,
+            "ps_cert_validate": False,
+        },
+        ("UNIVERSAL", "VMware vSphere"): {
+            "username": False,
+            "password": True,
+            "url": False,
+        },
+        ("UNIVERSAL", "S3Backup"): {
+            "AccessKeyId": False,
+            "SecretAccessKey": True,
+            "Provider": False,
+            "Endpoint": False,
+            "Region": False,
+            "Bucket": False,
+            "EncryptionPassword": True,
+            "EncryptionSalt": True,
+        },
+        ("SOAP_XML", "VMware vSphere SOAP"): {
+            "vmwareWebServiceUsername": False,
+            "vmwareWebServicePassword": True,
+            "url": False,
+        },
+        ("SOAP_XML", "aws"): {
+            "awsAccessKeyId": False,
+            "awsSecretAccessKey": True,
+            "awsEndpoint": False,
+            "proxyHost": False,
+            "proxyPort": False,
+            "proxyUser": False,
+            "proxyPasswd": True,
+        },
+        ("SOAP_XML", "azure"): {
+            "azureUrl": False,
+            "azureApplicationId": False,
+            "azureTenantId": False,
+            "azureSubscriptionId": False,
+            "azureSecretKey": True,
+            "proxyHost": False,
+            "proxyPort": False,
+            "proxyUser": False,
+            "proxyPasswd": True,
+        },
+        ("SOAP_XML", "aliyun"): {
+            "accessKey": False,
+            "accessKeyPassword": True,
+            "proxyHost": False,
+            "proxyPort": False,
+            "proxyUser": False,
+            "proxyPasswd": True,
+        },
+    }
+
+    # The REST-shaped subtypes withhold what REST v104 withholds, whether or not the template flags
+    # it. Prometheus v100 does not flag ``apikey``.
+    _REST_WITHHELD: ClassVar[frozenset[str]] = frozenset(
+        {
+            "password",
+            "proxyPasswd",
+            "authHeader",
+            "tokenKey",
+            "httpHeader1",
+            "httpHeader2",
+            "httpHeaders",
+            "opts",
+            "oauth2ClientSecret",
+            "oauth2ResourceOwnerPassword",
+            "oauth2ResourceOwnerAdditionalParams",
+            "apikey",
+            "authOverride",
+        }
+    )
+
+    EXPECTED_WITHHELD: ClassVar[dict[tuple[str, str], frozenset[str]]] = {
+        ("UNIVERSAL", "Low-code Tools: REST v105"): _REST_WITHHELD,
+        ("UNIVERSAL", "Low-code Tools: Prometheus v100"): _REST_WITHHELD - {"authOverride"},
+        ("UNIVERSAL", "HPE: Aruba Networking Central"): frozenset(
+            {
+                "proxyPasswd",
+                "httpHeaders",
+                "oauth2ClientSecret",
+                "oauth2ResourceOwnerPassword",
+                "oauth2ResourceOwnerAdditionalParams",
+            }
+        ),
+        ("UNIVERSAL", "Low-code Tools: SSH v105"): frozenset({"cred_pwd", "ssh_key_data"}),
+        ("UNIVERSAL", "VMware vSphere"): frozenset({"password"}),
+        ("UNIVERSAL", "S3Backup"): frozenset(
+            {"AccessKeyId", "SecretAccessKey", "EncryptionPassword", "EncryptionSalt"}
+        ),
+        ("SOAP_XML", "VMware vSphere SOAP"): frozenset({"vmwareWebServicePassword"}),
+        ("SOAP_XML", "aws"): frozenset({"awsAccessKeyId", "awsSecretAccessKey", "proxyPasswd"}),
+        ("SOAP_XML", "azure"): frozenset({"azureSecretKey", "proxyPasswd"}),
+        ("SOAP_XML", "aliyun"): frozenset({"accessKey", "accessKeyPassword", "proxyPasswd"}),
+    }
+
+    SUBTYPES: ClassVar[list[tuple[str, str]]] = list(MEASURED_TEMPLATES)
+
+    def test_every_measured_subtype_has_an_entry_and_a_decision(self) -> None:
+        assert set(self.EXPECTED_WITHHELD) == set(self.MEASURED_TEMPLATES)
+        for key in self.MEASURED_TEMPLATES:
+            assert key in ent._SUBTYPE_DEFINITION_ALLOWLIST, key
+
+    @pytest.mark.parametrize("key", SUBTYPES)
+    def test_no_encryption_flagged_field_is_allowlisted(self, key: tuple[str, str]) -> None:
+        flagged = {name for name, enc in self.MEASURED_TEMPLATES[key].items() if enc}
+        assert not (flagged & ent._SUBTYPE_DEFINITION_ALLOWLIST[key])
+        assert flagged <= self.EXPECTED_WITHHELD[key]
+
+    @pytest.mark.parametrize("key", SUBTYPES)
+    def test_every_withheld_field_is_a_known_secret_key(self, key: tuple[str, str]) -> None:
+        """So the scrub and the GraphQL guard, which have no allowlist, also know these names."""
+        assert self.EXPECTED_WITHHELD[key] <= set(KNOWN_SECRET_KEYS)
+
+    @pytest.mark.parametrize("key", SUBTYPES)
+    def test_the_safe_fields_come_back_and_the_secrets_do_not(self, key: tuple[str, str]) -> None:
+        credential_type, sub_type = key
+        template = self.MEASURED_TEMPLATES[key]
+        definition = json.dumps(dict.fromkeys(template, CANARY))
+
+        kept, withheld, reason = ent._filter_definition(definition, credential_type, sub_type)
+
+        assert reason is None
+        assert set(withheld) == self.EXPECTED_WITHHELD[key]
+        assert set(kept) == set(template) - self.EXPECTED_WITHHELD[key]
+        assert kept, "every field withheld is the defect, not a fix"
+
+    @pytest.mark.parametrize("key", SUBTYPES)
+    def test_the_allowlist_names_no_field_the_template_lacks(self, key: tuple[str, str]) -> None:
+        """A misspelled safe name would withhold a safe field forever without failing anything.
+
+        The REST-shaped subtypes reuse the REST v104 set, which names fields some of them lack;
+        only the names an entry adds beyond that set are checked for those.
+        """
+        allowed = ent._SUBTYPE_DEFINITION_ALLOWLIST[key]
+        if allowed >= ent._DEFINITION_ALLOWLIST["UNIVERSAL"]:
+            allowed = allowed - ent._DEFINITION_ALLOWLIST["UNIVERSAL"]
+        assert allowed <= set(self.MEASURED_TEMPLATES[key]), sorted(
+            allowed - set(self.MEASURED_TEMPLATES[key])
+        )
 
 
 class TestEverySecretIsWithheldForEveryType:
@@ -933,7 +1179,9 @@ class TestNonVacuity:
 
     def test_the_secret_table_is_not_empty_and_the_fixtures_use_it(self) -> None:
         """The cheapest vacuity check of all, and the one most likely to be needed."""
-        assert len(KNOWN_SECRET_KEYS) >= 20
+        assert len(KNOWN_SECRET_KEYS) >= 26
+        for pinned in ("password", "sshKeyData", "snmpRoCommunity", "authHeader", "AwsAccessKeyId"):
+            assert pinned in KNOWN_SECRET_KEYS, f"{pinned} fell out of the canonical secret list"
         assert len(CREDENTIAL_TYPES) == 8
         for credential_type in CREDENTIAL_TYPES:
             parsed = json.loads(definition_for(credential_type))

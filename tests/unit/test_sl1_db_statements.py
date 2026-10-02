@@ -36,7 +36,6 @@ ALL_BUILDERS = (
         severity=3,
         event_policy=0,
     ),
-    lambda: st.resolve_root_did_by_name("vcenter-1"),
     lambda: st.read_root_summary(42),
     lambda: st.read_component_map(42),
     lambda: st.resolve_powerpack_guid_by_name("Cisco: Base Pack"),
@@ -401,10 +400,14 @@ class TestAlignmentStatements:
 
 
 class TestComponentTreeStatements:
-    def test_the_root_lookup_is_its_own_statement_with_no_session_variable(self) -> None:
-        statement = st.resolve_root_did_by_name("vcenter-1")
-        assert "SET @" not in statement.sql
-        assert statement.params == ("vcenter-1",)
+    def test_there_is_no_sql_root_lookup(self) -> None:
+        """The root is resolved through REST so SL1's organization ACL applies.
+
+        A SQL name lookup runs on the service's own connection, which sees every organization. Its
+        builder is gone rather than unused, so nothing can start calling it again.
+        """
+        assert not hasattr(st, "resolve_root_did_by_name")
+        assert "resolve_root_did_by_name" not in st.__all__
 
     def test_no_statement_in_this_module_uses_a_session_variable(self) -> None:
         """Session variables are designed out rather than worked around.
@@ -418,13 +421,77 @@ class TestComponentTreeStatements:
             assert "@ct" not in sql
             assert "@root" not in sql
 
-    def test_both_outer_joins_are_preserved(self) -> None:
-        """An inner join would silently drop every vanished component."""
+    def test_components_are_scoped_to_the_roots_organization(self) -> None:
+        """A component in another organization must not come back as itself.
+
+        The organization predicate sits in the outer join's ``ON`` clause, not in ``WHERE``, so an
+        out-of-scope row still returns (as NULLs) and can be counted as withheld.
+        """
         sql = st.read_component_map(42).sql
-        assert sql.count("LEFT JOIN") == 2
-        assert "legend_device_vanished" in sql
-        assert "'vanished'" in sql
-        assert "'unknown'" in sql
+        assert "JOIN master_dev.legend_device r ON r.id = m.root_did" in sql
+        assert (
+            "LEFT JOIN master_dev.legend_device d ON d.id = m.component_did AND d.roa_id = r.roa_id"
+            in sql
+        )
+        assert (
+            "LEFT JOIN master_dev.legend_device_vanished v "
+            "ON v.id = m.component_did AND v.roa_id = r.roa_id"
+        ) in sql
+        # The outer ``WHERE`` is the last one; the earlier one belongs to the class sub-select.
+        assert "roa_id" not in sql.rsplit(" WHERE ", 1)[1]
+
+    def test_vanished_components_are_labelled_and_unmatched_ones_are_not(self) -> None:
+        """An in-scope component is active or vanished; anything else gets a NULL state.
+
+        There is no ``'unknown'`` label: a component in neither table, like one in another
+        organization, comes back as NULLs and is counted as withheld.
+        """
+        sql = st.read_component_map(42).sql
+        labels = "WHEN d.id IS NOT NULL THEN 'active' WHEN v.id IS NOT NULL THEN 'vanished' END"
+        assert labels in sql
+        assert "'unknown'" not in sql
+        assert " ELSE " not in sql
+
+    def test_every_map_column_is_masked_for_an_out_of_scope_row(self) -> None:
+        """A withheld row carries nothing that identifies the component.
+
+        The id and name come from ``d``/``v`` and every ``component_dev_map`` column is wrapped, so
+        an out-of-scope component's ids, unique id and discovering application stay in the
+        database.
+        """
+        sql = st.read_component_map(42).sql
+        projection = sql.split(" FROM master_dev.component_dev_map ", 1)[0]
+        assert projection.startswith("SELECT COALESCE(d.id, v.id), ")
+        assert "m.component_did" not in projection
+        for column in ("m.unique_id", "m.discovered_by_aid", "m.last_seen"):
+            assert f"IF(COALESCE(d.id, v.id) IS NULL, NULL, {column})" in projection, column
+        assert "CASE WHEN COALESCE(d.id, v.id) IS NULL THEN NULL " in projection
+
+    def test_an_out_of_scope_parent_is_masked(self) -> None:
+        """An in-scope component's parent is returned only if it is the root, 0 or in scope.
+
+        The parent is joined like the component itself, on its id and the root's ``roa_id``, as
+        outer joins, so a parent in another organization (or in neither table) comes back as NULL
+        while the component row itself survives.
+        """
+        sql = st.read_component_map(42).sql
+        assert (
+            "LEFT JOIN master_dev.legend_device pd ON pd.id = m.parent_did AND pd.roa_id = r.roa_id"
+            in sql
+        )
+        assert (
+            "LEFT JOIN master_dev.legend_device_vanished pv "
+            "ON pv.id = m.parent_did AND pv.roa_id = r.roa_id"
+        ) in sql
+        projection = sql.split(" FROM master_dev.component_dev_map ", 1)[0]
+        parent = (
+            "CASE WHEN COALESCE(d.id, v.id) IS NULL THEN NULL "
+            "WHEN m.parent_did = m.root_did OR m.parent_did = 0 "
+            "OR COALESCE(pd.id, pv.id) IS NOT NULL THEN m.parent_did END"
+        )
+        assert parent in projection
+        # No ELSE: an unmatched parent falls through to NULL.
+        assert " ELSE " not in sql
 
     def test_the_component_column_order_is_the_source_order(self) -> None:
         # The caller unpacks by position, so order is behaviour.
@@ -433,15 +500,19 @@ class TestComponentTreeStatements:
         # class-name sub-select, and splitting there truncates the projection before unique_id.
         projection = sql.split(" FROM master_dev.component_dev_map ", 1)[0]
         for earlier, later in (
-            ("m.component_did", "m.parent_did"),
-            ("m.parent_did", "m.unique_id"),
+            ("COALESCE(d.id, v.id)", "m.parent_did"),
+            ("m.parent_did", "COALESCE(d.device, v.device)"),
+            ("COALESCE(d.device, v.device)", "'active'"),
+            ("'vanished'", "m.unique_id"),
             ("m.unique_id", "m.discovered_by_aid"),
             ("m.discovered_by_aid", "m.last_seen"),
         ):
             assert projection.index(earlier) < projection.index(later), f"{earlier} vs {later}"
 
     def test_the_tree_is_scoped_to_the_root(self) -> None:
-        assert "WHERE m.root_did = %s" in st.read_component_map(42).sql
+        statement = st.read_component_map(42)
+        assert "WHERE m.root_did = %s" in statement.sql
+        assert statement.params == (42,)
 
 
 class TestResolveDeviceCollector:

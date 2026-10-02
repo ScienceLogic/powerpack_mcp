@@ -12,10 +12,12 @@ from __future__ import annotations
 import ast
 import logging
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 
@@ -27,6 +29,7 @@ from powerpack_mcp.lce_client import (
     LceClient,
     is_valid_target_host,
 )
+from powerpack_mcp.mcp_app.concurrency import OUTBOUND_DEADLINE_MARGIN_SECONDS, REQUEST_DEADLINE
 
 
 def _client_with(
@@ -444,3 +447,82 @@ class TestLcePathsMustBeAbsolute:
 
         # And guard against the pattern matching nothing, which would also pass vacuously.
         assert len(checked) >= 2, f"expected at least the two known constants, found {checked}"
+
+
+# ---- the request deadline ------------------------------------------------------------------------
+
+
+def _hanging_client(config: Config) -> tuple[LceClient, list[httpx.Request]]:
+    """A client whose transport accepts every request and never answers it."""
+    seen: list[httpx.Request] = []
+
+    async def never(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        await anyio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    client = LceClient(config)
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(never))
+    return client, seen
+
+
+class TestRequestDeadline:
+    """The whole exchange ends ``OUTBOUND_DEADLINE_MARGIN_SECONDS`` before the request deadline.
+
+    Mirrors ``test_sl1_client``: the httpx timeouts equal the gate's deadline, so without this the
+    gate cancels the request just before ``LceUnreachable`` could be returned.
+    """
+
+    _BUDGET = 0.3
+
+    @pytest.mark.anyio
+    async def test_a_hanging_lce_raises_unreachable_at_the_budget(
+        self, config: Config, credential: LceCredential
+    ) -> None:
+        client, seen = _hanging_client(config)
+        token = REQUEST_DEADLINE.set(
+            time.monotonic() + OUTBOUND_DEADLINE_MARGIN_SECONDS + self._BUDGET
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(LceUnreachable) as exc:
+                await client.request(credential=credential, method="GET", path="/powerpacks")
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        elapsed = time.monotonic() - started
+        assert len(seen) == 1
+        assert isinstance(exc.value.__cause__, TimeoutError)
+        assert self._BUDGET - 0.05 <= elapsed < self._BUDGET + OUTBOUND_DEADLINE_MARGIN_SECONDS / 2
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("offset", [OUTBOUND_DEADLINE_MARGIN_SECONDS / 2, -1.0])
+    async def test_a_spent_budget_sends_nothing(
+        self, config: Config, credential: LceCredential, offset: float
+    ) -> None:
+        client, seen = _hanging_client(config)
+        token = REQUEST_DEADLINE.set(time.monotonic() + offset)
+        try:
+            with pytest.raises(LceUnreachable):
+                await client.request(credential=credential, method="GET", path="/powerpacks")
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        assert seen == [], "a request that cannot finish before the gate must not be sent"
+
+    @pytest.mark.anyio
+    async def test_without_a_deadline_a_slow_response_still_completes(
+        self, config: Config, credential: LceCredential
+    ) -> None:
+        """Outside a gated request (no deadline in force) nothing new bounds the call."""
+
+        async def slow(_request: httpx.Request) -> httpx.Response:
+            await anyio.sleep(0.2)
+            return httpx.Response(200, json={"ok": True})
+
+        client = LceClient(config)
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+        token = REQUEST_DEADLINE.set(None)
+        try:
+            response = await client.request(credential=credential, method="GET", path="/x")
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        assert response.body == {"ok": True}

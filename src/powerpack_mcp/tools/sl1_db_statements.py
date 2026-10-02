@@ -53,7 +53,6 @@ __all__ = [
     "resolve_class_type_by_guid",
     "resolve_device_collector",
     "resolve_powerpack_guid_by_name",
-    "resolve_root_did_by_name",
     "update_device_class",
 ]
 
@@ -157,22 +156,16 @@ def insert_active_event(
 # =================================================================================================
 
 
-def resolve_root_did_by_name(device_name: str) -> Statement:
-    """Resolve a root device name to its id.
-
-    The result is passed as a parameter to the statements that follow, so there is no session
-    variable. A numeric ``root`` skips this statement entirely.
-    """
-    return Statement(
-        "SELECT id FROM master_dev.legend_device WHERE device = %s LIMIT 1",
-        (device_name,),
-    )
+# There is no root-resolution statement. ``sl1_get_component_tree`` resolves its root through
+# REST with the caller's credential (``sl1_db_pipeline.resolve_device``) so SL1's organization ACL
+# applies before any of these statements runs; a SQL name lookup would bypass it.
 
 
 def read_root_summary(root_did: int) -> Statement:
     """Read the root device's name and class.
 
-    Unlike the reference, this does not re-select the root id; the caller already holds it.
+    Unlike the reference, this does not re-select the root id; the caller already holds it, and has
+    already confirmed through REST that the caller's account can see it.
     """
     return Statement(
         "SELECT (SELECT device FROM master_dev.legend_device WHERE id = %s), "
@@ -184,24 +177,49 @@ def read_root_summary(root_did: int) -> Statement:
 
 
 def read_component_map(root_did: int) -> Statement:
-    """Read every component beneath the root, with its state and discovering Dynamic Application.
+    """Read every component beneath the root that shares the root's organization.
 
     Column order is fixed because the caller unpacks by position: ``component_did, parent_did,
-    name, class, state, unique_id, discovered_by_aid, last_seen``. Both joins to ``legend_device``
-    and ``legend_device_vanished`` must stay outer joins: the ``CASE`` labelling a row active,
-    vanished or unknown depends on it, and an inner join would silently drop every vanished
-    component.
+    name, class, state, unique_id, discovered_by_aid, last_seen``.
+
+    The root itself has passed SL1's REST ACL by the time this runs, but its components have not,
+    so they are scoped here as defence in depth. SL1 puts a component in its root's organization,
+    so on a consistent appliance nothing is excluded (measured on two appliances: 946 map rows, no
+    mismatch). ``legend_device`` and ``legend_device_vanished`` both carry ``roa_id``, and each is
+    joined on the component's id *and* the root's ``roa_id``, as outer joins, so every map row
+    still comes back: an in-scope component in full, labelled active or vanished, and any other as
+    a row of NULLs that the caller counts as withheld without learning what it was. A component
+    with no row in either table has nothing to check against and is withheld the same way.
+
+    An in-scope component's ``parent_did`` is scoped the same way, through ``pd``/``pv``: it is
+    returned when it is the root, ``0``, or a device in the root's organization (active or
+    vanished), and is NULL otherwise, so an out-of-scope parent's id never leaves the database
+    either. The root has already passed REST, so it needs no check.
     """
+    # Every other map column is wrapped in ``IF(COALESCE(d.id, v.id) IS NULL, NULL, ...)``, the
+    # parent in a ``CASE`` that also checks ``pd``/``pv``, and the id and name come from ``d``/``v``
+    # rather than ``m``, so an out-of-scope row is all NULLs. Masked in SQL rather than dropped in
+    # Python, so its identifiers never leave the database.
     return Statement(
-        "SELECT m.component_did, m.parent_did, COALESCE(d.device, v.device), "
+        "SELECT COALESCE(d.id, v.id), "
+        "CASE WHEN COALESCE(d.id, v.id) IS NULL THEN NULL "
+        "WHEN m.parent_did = m.root_did OR m.parent_did = 0 "
+        "OR COALESCE(pd.id, pv.id) IS NOT NULL THEN m.parent_did END, "
+        "COALESCE(d.device, v.device), "
         "(SELECT CONCAT(class, ' | ', descript) FROM master.definitions_dev_classes dc "
         "WHERE dc.class_type = COALESCE(d.class_type, v.class_type) LIMIT 1), "
-        "CASE WHEN d.id IS NOT NULL THEN 'active' "
-        "WHEN v.id IS NOT NULL THEN 'vanished' ELSE 'unknown' END, "
-        "m.unique_id, m.discovered_by_aid, m.last_seen "
+        "CASE WHEN d.id IS NOT NULL THEN 'active' WHEN v.id IS NOT NULL THEN 'vanished' END, "
+        "IF(COALESCE(d.id, v.id) IS NULL, NULL, m.unique_id), "
+        "IF(COALESCE(d.id, v.id) IS NULL, NULL, m.discovered_by_aid), "
+        "IF(COALESCE(d.id, v.id) IS NULL, NULL, m.last_seen) "
         "FROM master_dev.component_dev_map m "
-        "LEFT JOIN master_dev.legend_device d ON d.id = m.component_did "
-        "LEFT JOIN master_dev.legend_device_vanished v ON v.id = m.component_did "
+        "JOIN master_dev.legend_device r ON r.id = m.root_did "
+        "LEFT JOIN master_dev.legend_device d ON d.id = m.component_did AND d.roa_id = r.roa_id "
+        "LEFT JOIN master_dev.legend_device_vanished v "
+        "ON v.id = m.component_did AND v.roa_id = r.roa_id "
+        "LEFT JOIN master_dev.legend_device pd ON pd.id = m.parent_did AND pd.roa_id = r.roa_id "
+        "LEFT JOIN master_dev.legend_device_vanished pv "
+        "ON pv.id = m.parent_did AND pv.roa_id = r.roa_id "
         "WHERE m.root_did = %s ORDER BY m.parent_did, m.component_did",
         (root_did,),
     )

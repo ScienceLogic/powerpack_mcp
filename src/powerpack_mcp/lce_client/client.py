@@ -15,6 +15,7 @@ whether to retry.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -171,17 +172,35 @@ class LceClient:
         :param target_host: The LCE host; defaults to ``LCE_DEFAULT_TARGET_HOST``.
         :return: The successful response.
         :raises LceHttpError: On a non-2xx status.
-        :raises LceUnreachable: On a connect failure, DNS failure or timeout, or an invalid host.
+        :raises LceUnreachable: On a connect failure, DNS failure or timeout, an invalid host, or
+            when the request deadline's outbound budget is spent or runs out.
         :raises LceMalformedResponse: If the body is not a JSON object or array.
         """
         host = self._resolve_target_host(target_host)
         self._warn_if_tls_relaxed()
         url = self._build_url(host, path, query)
 
+        # Function-local because of an import cycle: ``mcp_app/__init__`` imports ``mcp_app.app``,
+        # which imports this module.
+        from powerpack_mcp.mcp_app.concurrency import outbound_budget_seconds
+
+        # The whole exchange is bounded by the request deadline less a margin, so a slow LCE fails
+        # here with ``LceUnreachable`` before the concurrency gate cancels the request and leaves
+        # the caller with no reply. The httpx timeouts cannot do this: they equal the gate's
+        # deadline, and the read timeout is per chunk, not total. ``mcp_app.concurrency`` explains
+        # the margin.
+        budget = outbound_budget_seconds()
+        if budget is not None and budget <= 0.0:
+            # Sending would only start work the gate is about to cancel.
+            raise LceUnreachable(host)
         try:
-            response = await self._client.request(
-                method, url, headers=self._headers(credential), json=json_body
-            )
+            async with asyncio.timeout(budget):
+                response = await self._client.request(
+                    method, url, headers=self._headers(credential), json=json_body
+                )
+        except TimeoutError as exc:
+            # The same error an httpx timeout produces, so callers and envelopes are unchanged.
+            raise LceUnreachable(host) from exc
         except (
             httpx.ConnectError,
             httpx.ConnectTimeout,

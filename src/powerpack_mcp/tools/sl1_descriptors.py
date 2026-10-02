@@ -122,9 +122,13 @@ class GraphQlDescriptor:
 
 # ---- The four REST passthroughs ------------------------------------------------------------------
 #
-# These four are an arbitrary-request capability, registered by default and bounded only by SL1's
-# own authorization. The audit trail is the only compensating control, which is why
-# ``is_passthrough`` is descriptor data.
+# These four are an arbitrary-request capability, registered by default and bounded by SL1's own
+# authorization. Two controls compensate. The audit trail is one, which is why ``is_passthrough`` is
+# descriptor data. ``sl1_credential_guard`` is the other: SL1's authorization lets an entitled
+# account read stored credential secrets, so these tools refuse REST credential resources other
+# than the plain indexes, refuse ``filter.``/``order.`` on secret-named fields and any
+# ``link_disp_field`` beyond plain display fields on every resource, and scrub every response for
+# secrets, keeping the passthroughs to the promise the typed credential readers make.
 
 REST_REQUEST: Final = Sl1OperationDescriptor(
     tool_name="sl1_rest_request",
@@ -501,6 +505,14 @@ GRAPHQL_TYPED_DESCRIPTORS: Final[tuple[GraphQlDescriptor, ...]] = (
 # It does not apply them to introspection: a restricted account can read the full schema, including
 # fields it is forbidden to query. ``is_introspection`` therefore marks a tool with a different
 # exposure profile from its sibling.
+#
+# The caller's permissions do not protect credential secrets from a caller entitled to read
+# credentials. ``sl1_graphql`` therefore refuses, before sending, any document that would read them:
+# inside a credential only allowlisted metadata may be selected, secret-named fields are refused on
+# every type, and so are searches and sorts on either. It scrubs every response as well. The Guided
+# Discovery tool applies the same check to every workflow-authored step before creating the
+# session. ``sl1_credential_guard`` states the rule. ``sl1_graphql_introspect`` runs
+# fixed documents that read the schema only, and needs neither.
 
 GRAPHQL_QUERY: Final = GraphQlDescriptor(
     tool_name="sl1_graphql",

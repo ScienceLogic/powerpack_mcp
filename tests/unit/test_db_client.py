@@ -32,7 +32,7 @@ from powerpack_mcp.errors import (
     DbUnreachable,
     LogEvent,
 )
-from powerpack_mcp.mcp_app.concurrency import REQUEST_DEADLINE
+from powerpack_mcp.mcp_app.concurrency import OUTBOUND_DEADLINE_MARGIN_SECONDS, REQUEST_DEADLINE
 from powerpack_mcp.mcp_app.correlation import CORRELATION_ID
 from powerpack_mcp.sql import Statement
 
@@ -232,6 +232,46 @@ class TestSpentDeadlineRefusal:
         events = [r.__dict__.get("event") for r in caplog.records]
         assert str(LogEvent.DB_DEADLINE_EXCEEDED) in events
         assert str(LogEvent.DB_QUERY_TIMEOUT) not in events
+        await client.aclose()
+
+
+@pytest.mark.anyio
+class TestStatementsFinishBeforeTheGate:
+    """``max_statement_time`` is the outbound budget, not the full remainder.
+
+    With the full remainder, MariaDB's errno 1969 and the concurrency gate's cancellation land at
+    the same instant, the gate wins, and the caller gets no reply instead of ``db_query_timeout``.
+    """
+
+    async def test_the_statement_timeout_leaves_the_margin(self) -> None:
+        factory = _CursorFactory()
+        _install(factory)
+        client = dbc.DbClient(max_concurrent_requests=1)
+        token = REQUEST_DEADLINE.set(time.monotonic() + 10.0)
+        try:
+            await client.fetch_all(Statement("SELECT 1"))
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        (cursor,) = factory.created
+        (preamble,) = [s for s in cursor.statements if s[0].startswith("SET SESSION")]
+        args = preamble[1]
+        assert isinstance(args, tuple)
+        assert float(args[0]) == pytest.approx(10.0 - OUTBOUND_DEADLINE_MARGIN_SECONDS, abs=0.1)
+        await client.aclose()
+
+    @pytest.mark.parametrize("method", ["fetch_all", "run_unit"])
+    async def test_a_deadline_inside_the_margin_is_refused_unissued(self, method: str) -> None:
+        """Time remains on the deadline, but not enough for a statement to report back."""
+        factory = _CursorFactory()
+        _install(factory)
+        client = dbc.DbClient(max_concurrent_requests=1)
+        token = REQUEST_DEADLINE.set(time.monotonic() + OUTBOUND_DEADLINE_MARGIN_SECONDS / 2)
+        try:
+            with pytest.raises(DbDeadlineExceeded):
+                await getattr(client, method)(Statement("SELECT 1"))
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        assert factory.created == []
         await client.aclose()
 
 
