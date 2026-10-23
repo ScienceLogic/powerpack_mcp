@@ -2,6 +2,8 @@
 
 An MCP Server for PowerPack development.
 
+Requires Skylar 12.5.20 as the minimum version.
+
 A remote **streamable-HTTP** FastMCP server for Skylar One. It runs as a systemd unit on a loopback
 listener and is reverse-proxied by nginx at `/mcp`, which enforces the existing Skylar One
 authentication scheme before proxying and **fails closed**.
